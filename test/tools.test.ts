@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { DetachedManager } from "../src/detached"
 import { JobManager } from "../src/jobs"
 import { JobStore } from "../src/store"
 import { dispatch } from "../src/tools"
@@ -6,10 +7,12 @@ import { dispatch } from "../src/tools"
 function harness() {
   const jobs = new JobManager()
   const store = new JobStore(":memory:")
+  const detached = new DetachedManager(store)
   return {
-    run: (name: string, args: Record<string, unknown> = {}) => dispatch(jobs, store, name, args),
+    run: (name: string, args: Record<string, unknown> = {}) => dispatch(jobs, store, detached, name, args),
     jobs,
     store,
+    detached,
   }
 }
 
@@ -67,6 +70,73 @@ describe("runtime tools", () => {
     const waited = await run("wait", { job_id: id, timeout_s: 0.05 })
     expect(structured(waited).timed_out).toBe(true)
     await run("stop", { job_id: id })
+  })
+
+  test("output reads a session answered through the shared database", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionPeeks("/proj")
+        if (pending) {
+          store.answerSessionPeek(pending.id, { text: "working", running: true, messages: 4 })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+
+    const result = await dispatch(new JobManager(), store, undefined, "output", { session_id: "ses_1" }, "/proj")
+    await answered
+    expect(structured(result).text).toBe("working")
+    expect(structured(result).running).toBe(true)
+    expect(structured(result).messages).toBe(4)
+    expect(store.pendingSessionPeeks("/proj")).toHaveLength(0)
+  })
+
+  test("output applies tail_bytes to a session answer", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionPeeks("/proj")
+        if (pending) {
+          store.answerSessionPeek(pending.id, { text: "abcdef", running: false, messages: 1 })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "output", { session_id: "ses_1", tail_bytes: 3 }, "/proj")
+    await answered
+    expect(structured(result).text).toBe("def")
+    expect(structured(result).truncated).toBe(true)
+  })
+
+  test("output surfaces a session read error from the plugin", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionPeeks("/proj")
+        if (pending) {
+          store.answerSessionPeek(pending.id, { error: "boom" })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "output", { session_id: "ses_1" }, "/proj")
+    await answered
+    expect(result).toMatchObject({ isError: true })
+    expect((result.content as { text: string }[])[0]!.text).toContain("boom")
+  })
+
+  test("output errors for an unregistered session directory or no id", async () => {
+    const { run } = harness()
+    expect(await run("output", { session_id: "ses_1" })).toMatchObject({ isError: true })
+    expect(await run("output", {})).toMatchObject({ isError: true })
+    expect(await dispatch(new JobManager(), undefined, undefined, "output", { session_id: "ses_1" })).toMatchObject({ isError: true })
   })
 })
 
@@ -130,8 +200,8 @@ describe("persistent job tools", () => {
 
   test("persistent tools fail cleanly when the store is unavailable", async () => {
     const jobs = new JobManager()
-    expect(await dispatch(jobs, undefined, "list_jobs", {})).toMatchObject({ isError: true })
-    expect(await dispatch(jobs, undefined, "start", { command: "true" })).not.toMatchObject({ isError: true })
+    expect(await dispatch(jobs, undefined, undefined, "list_jobs", {})).toMatchObject({ isError: true })
+    expect(await dispatch(jobs, undefined, undefined, "start", { command: "true" })).not.toMatchObject({ isError: true })
   })
 
   test("run_job records a completion with definition metadata", async () => {
@@ -152,7 +222,7 @@ describe("persistent job tools", () => {
         metadata: meta.metadata as Record<string, unknown> | undefined,
       })
     })
-    const run = (name: string, args: Record<string, unknown> = {}) => dispatch(jobs, store, name, args)
+    const run = (name: string, args: Record<string, unknown> = {}) => dispatch(jobs, store, new DetachedManager(store), name, args)
     await run("create_job", { name: "greet", command: "printf hi", metadata: { k: "v" } })
     const started = await run("run_job", { job: "greet" })
     const jobID = structured(started).job_id as string
@@ -163,5 +233,26 @@ describe("persistent job tools", () => {
     expect(pending[0]!.definition_name).toBe("greet")
     expect(pending[0]!.output).toBe("hi")
     expect(pending[0]!.metadata).toEqual({ k: "v" })
+  })
+
+  test("run_detached is routed through dispatch and inspectable", async () => {
+    const { run } = harness()
+    const started = await run("run_detached", { command: "printf routed" })
+    expect(structured(started).detached).toBe(true)
+    const id = structured(started).job_id as string
+    let status = structured(started)
+    for (let i = 0; i < 200 && status.status === "running"; i++) {
+      await Bun.sleep(25)
+      status = structured(await run("status", { job_id: id }))
+    }
+    expect(status.status).toBe("completed")
+    expect(structured(await run("output", { job_id: id })).text).toBe("routed")
+    const listed = structured(await run("list", {})).jobs as { detached?: boolean }[]
+    expect(listed.at(-1)?.detached).toBe(true)
+  })
+
+  test("run_detached errors without a store", async () => {
+    const jobs = new JobManager()
+    expect(await dispatch(jobs, undefined, undefined, "run_detached", { command: "true" })).toMatchObject({ isError: true })
   })
 })

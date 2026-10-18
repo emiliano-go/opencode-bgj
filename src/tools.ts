@@ -1,6 +1,10 @@
+import { DetachedManager } from "./detached"
 import type { JobInfo } from "./jobs"
 import { JobManager } from "./jobs"
 import type { JobDefinition, JobDefinitionPatch, JobStore } from "./store"
+
+const SESSION_PEEK_TIMEOUT_MS = 5000
+const SESSION_PEEK_POLL_MS = 50
 
 export const TOOLS = [
   {
@@ -67,17 +71,18 @@ Returns the same fields as list for that job: job_id, command, cwd, pid, status,
   },
   {
     name: "output",
-    description: `Read the captured stdout and stderr of a background job. Both streams are merged in the order they were produced. Use it to inspect a job's log while it is still running or after it finishes.
-For large logs, pass tail_bytes to read only the end, or offset to resume from a byte position; otherwise the entire buffered output is returned. The buffer keeps only the most recent 1 MiB, so very old output may already have been dropped.
-Returns job_id, text, size_bytes (total bytes the job has written so far, even if some were dropped), and truncated (true when text does not start at byte 0 of the job's output).`,
+    description: `Read the current output of a job. Pass job_id for a background shell job, or session_id to read what a running opencode session (for example a background subagent) has produced so far.
+For a shell job both streams are merged in the order produced; the buffer keeps the most recent 1 MiB and tail_bytes or offset select a slice.
+For a session it returns the latest assistant message text, whether the session is still running, and how many messages it has. Pass exactly one of job_id or session_id.
+Returns the id, text, size_bytes (total produced so far, even if some was dropped), and truncated (true when text does not start at the beginning).`,
     inputSchema: {
       type: "object",
       properties: {
         job_id: { type: "string", description: "Background job id returned by start or run_job." },
+        session_id: { type: "string", description: "Session id to read the current output of, for example a background subagent's task id." },
         tail_bytes: { type: "integer", minimum: 0, description: "Return only the last N bytes of output instead of everything from the start." },
         offset: { type: "integer", minimum: 0, description: "Return output starting at this 0-based byte offset into the job's total output." },
       },
-      required: ["job_id"],
     },
   },
   {
@@ -187,6 +192,28 @@ By default the result is reported back to the agent as a message when the job fi
       required: ["job"],
     },
   },
+  {
+    name: "run_detached",
+    description: `Run a shell command fully detached from this session and return immediately with its job id and log path. The command keeps running after the session (and this server) exits, and it never sends a completion notification: it is fire-and-forget.
+Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
+Use it for work that must outlive the session: a long download, a build, or a one-off server you want to survive a restart. For work you want to observe and be woken about inside this session, use start instead.
+There is no timeout_ms: nothing stays resident to enforce one.
+Returns the job_id, command, cwd, pid, status ("running"), started_at, the log file path, and detached ("true").`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Shell command to run, invoked as <shell> -c <command>." },
+        cwd: { type: "string", description: "Working directory for the command. Defaults to the MCP server's current directory." },
+        env: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "Extra environment variables merged over the server's environment for this job.",
+        },
+        shell: { type: "string", description: "Shell binary used to run the command. Default /bin/sh." },
+      },
+      required: ["command"],
+    },
+  },
 ]
 
 const PERSISTENT_TOOLS = new Set(["create_job", "list_jobs", "get_job", "update_job", "delete_job", "run_job"])
@@ -196,30 +223,50 @@ export type ToolResult = Record<string, unknown>
 export async function dispatch(
   jobs: JobManager,
   store: JobStore | undefined,
+  detached: DetachedManager | undefined,
   name: string,
   args: Record<string, unknown>,
+  directory: string = process.cwd(),
 ): Promise<ToolResult> {
   try {
-    if (PERSISTENT_TOOLS.has(name) && !store) return fail("job store unavailable")
+    if (name === "run_detached" && (!store || !detached)) return fail("job store unavailable")
+    if (!store && PERSISTENT_TOOLS.has(name)) return fail("job store unavailable")
     switch (name) {
       case "start":
         return ok(toWire(jobs.start(readStart(args))))
-      case "list":
-        return ok({ jobs: jobs.list(args.active_only === true).map(toWire) })
+      case "run_detached":
+        return ok(detached!.start(readDetached(args), directory))
+      case "list": {
+        const activeOnly = args.active_only === true
+        const entries: object[] = jobs.list(activeOnly).map(toWire)
+        if (detached) entries.push(...detached.list(directory).filter((job) => !activeOnly || job.status === "running"))
+        entries.sort((a, b) => (a as { started_at: number }).started_at - (b as { started_at: number }).started_at)
+        return ok({ jobs: entries })
+      }
       case "status":
         return withId(args.job_id, (id) => {
           const info = jobs.status(id)
-          return info ? ok(toWire(info)) : unknownJob(id)
+          if (info) return ok(toWire(info))
+          const job = detached?.status(id)
+          return job ? ok(job) : unknownJob(id)
         })
-      case "output":
+      case "output": {
+        const sessionID = optionalStr(args.session_id)
+        if (sessionID !== undefined) return await sessionOutput(store, directory, sessionID, args)
         return withId(args.job_id, (id) => {
-          const result = jobs.output(id, { tailBytes: optionalInt(args.tail_bytes), offset: optionalInt(args.offset) })
-          return result ? ok({ job_id: id, ...result }) : unknownJob(id)
+          const options = { tailBytes: optionalInt(args.tail_bytes), offset: optionalInt(args.offset) }
+          const result = jobs.output(id, options)
+          if (result) return ok({ job_id: id, ...result })
+          const job = detached?.output(id, options)
+          return job ? ok({ job_id: id, ...job }) : unknownJob(id)
         })
+      }
       case "stop":
         return await withIdAsync(args.job_id, async (id) => {
           const info = await jobs.stop(id, optionalStr(args.signal))
-          return info ? ok(toWire(info)) : unknownJob(id)
+          if (info) return ok(toWire(info))
+          const job = await detached?.stop(id, optionalStr(args.signal))
+          return job ? ok(job) : unknownJob(id)
         })
       case "wait":
         return await withIdAsync(args.job_id, async (id) => {
@@ -312,6 +359,15 @@ function readStart(args: Record<string, unknown>) {
   }
 }
 
+function readDetached(args: Record<string, unknown>) {
+  return {
+    command: str(args.command, "command"),
+    cwd: optionalStr(args.cwd),
+    env: strRecord(args.env),
+    shell: optionalStr(args.shell),
+  }
+}
+
 function readDefinition(args: Record<string, unknown>) {
   return {
     name: str(args.name, "name"),
@@ -336,7 +392,7 @@ function readPatch(args: Record<string, unknown>): JobDefinitionPatch {
   return patch
 }
 
-function ok(structured: Record<string, unknown>): ToolResult {
+function ok(structured: object): ToolResult {
   return { content: [{ type: "text" as const, text: JSON.stringify(structured, null, 2) }], structuredContent: structured }
 }
 
@@ -346,6 +402,50 @@ function fail(message: string): ToolResult {
 
 function unknownJob(id: string): ToolResult {
   return fail(`unknown job: ${id}`)
+}
+
+async function sessionOutput(
+  store: JobStore | undefined,
+  directory: string,
+  sessionID: string,
+  args: Record<string, unknown>,
+): Promise<ToolResult> {
+  if (!store) return fail("job store unavailable")
+  if (!store.hasInstance(directory)) {
+    return fail(`no opencode instance registered for ${directory}; install and restart the bgj-notify plugin`)
+  }
+  const id = store.requestSessionPeek(directory, sessionID)
+  try {
+    const deadline = Date.now() + SESSION_PEEK_TIMEOUT_MS
+    let peek = store.sessionPeek(id)
+    while ((!peek || peek.status === "pending") && Date.now() < deadline) {
+      await delay(SESSION_PEEK_POLL_MS)
+      peek = store.sessionPeek(id)
+    }
+    if (!peek || peek.status === "pending") {
+      return fail(`timed out waiting for the plugin to read session ${sessionID}; is the bgj-notify plugin running?`)
+    }
+    if (peek.status === "error") return fail(peek.error ?? `could not read session ${sessionID}`)
+    const bytes = Buffer.from(peek.text ?? "")
+    const offset = optionalInt(args.offset)
+    const tailBytes = optionalInt(args.tail_bytes)
+    const start =
+      offset !== undefined ? Math.max(0, offset) : tailBytes !== undefined ? Math.max(0, bytes.length - tailBytes) : 0
+    return ok({
+      session_id: sessionID,
+      text: bytes.subarray(start).toString(),
+      size_bytes: bytes.length,
+      truncated: start > 0,
+      running: peek.running ?? false,
+      messages: peek.messages ?? 0,
+    })
+  } finally {
+    store.deleteSessionPeek(id)
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function unknownDefinition(ref: string): ToolResult {

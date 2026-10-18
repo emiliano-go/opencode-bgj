@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
-import { homedir } from "node:os"
+import { mkdirSync, rmSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
 export interface JobDefinition {
@@ -50,6 +50,51 @@ export interface JobRun extends JobRunInput {
   notified: boolean
 }
 
+export interface SessionPeek {
+  id: string
+  directory: string
+  session_id: string
+  status: "pending" | "done" | "error"
+  text?: string
+  running?: boolean
+  messages?: number
+  error?: string
+  created_at: number
+  answered_at?: number
+}
+
+export interface DetachedRunInput {
+  id: string
+  command: string
+  cwd?: string
+  pid: number
+  status: string
+  exit_code: number | null
+  started_at: number
+  ended_at: number | null
+  directory?: string
+}
+
+export interface DetachedRun extends DetachedRunInput {}
+
+export interface DetachedRunPatch {
+  status?: string
+  exit_code?: number | null
+  ended_at?: number | null
+}
+
+interface DetachedRow {
+  id: string
+  command: string
+  cwd: string | null
+  pid: number
+  status: string
+  exit_code: number | null
+  started_at: number
+  ended_at: number | null
+  directory: string | null
+}
+
 interface RunRow {
   id: string
   definition_id: string | null
@@ -80,6 +125,19 @@ interface Row {
   updated_at: number
 }
 
+interface PeekRow {
+  id: string
+  directory: string
+  session_id: string
+  status: string
+  text: string | null
+  running: number | null
+  messages: number | null
+  error: string | null
+  created_at: number
+  answered_at: number | null
+}
+
 // Centralized, shared across every project and session. Override with
 // OPENCODE_BGJ_DB.
 export function defaultDatabasePath(): string {
@@ -88,12 +146,24 @@ export function defaultDatabasePath(): string {
   return join(base, "opencode-bgj", "jobs.db")
 }
 
+// Where run_detached logs and exit markers live. Kept beside the database so an
+// OPENCODE_BGJ_DB override (tests) isolates the files too; OPENCODE_BGJ_RUNS
+// overrides it outright.
+export function defaultRunsDir(dbPath: string = defaultDatabasePath()): string {
+  if (process.env.OPENCODE_BGJ_RUNS) return process.env.OPENCODE_BGJ_RUNS
+  if (dbPath === ":memory:") return join(tmpdir(), "opencode-bgj-runs", randomSuffix())
+  return join(dirname(dbPath), "runs")
+}
+
 export class JobStore {
   private readonly db: Database
+  private readonly detachedDir: string
   private closed = false
 
   constructor(path: string = defaultDatabasePath()) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true })
+    this.detachedDir = defaultRunsDir(path)
+    mkdirSync(this.detachedDir, { recursive: true })
     this.db = new Database(path)
     this.db.exec("PRAGMA journal_mode = WAL")
     this.db.exec("PRAGMA busy_timeout = 5000")
@@ -132,6 +202,50 @@ export class JobStore {
     if (!this.hasColumn("job_runs", "directory")) this.db.exec("ALTER TABLE job_runs ADD COLUMN directory TEXT")
     this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending ON job_runs (notify, notified, ended_at)")
     this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending_dir ON job_runs (notify, notified, directory, ended_at)")
+    // Written by the plugin, which knows the opencode server URL; read by the
+    // server as a liveness signal for the directory's instance. The TUI runs its
+    // server in-process, so the URL is informational and not reachable from here.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS instances (
+        directory TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `)
+    // output(session_id) cannot read a session in-process (the MCP server is a
+    // separate process), so it files a request here and the plugin, which shares
+    // the opencode process, answers it on its next poll.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_peeks (
+        id TEXT PRIMARY KEY,
+        directory TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        text TEXT,
+        running INTEGER,
+        messages INTEGER,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        answered_at INTEGER
+      )
+    `)
+    this.db.exec("CREATE INDEX IF NOT EXISTS session_peeks_pending ON session_peeks (status, directory, created_at)")
+    // run_detached jobs: spawned in their own session so they outlive this
+    // process, with output on disk. Kept out of job_runs so they never enter
+    // the plugin's notify queue; that is what makes a detached job silent.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS detached_runs (
+        id TEXT PRIMARY KEY,
+        command TEXT NOT NULL,
+        cwd TEXT,
+        pid INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        exit_code INTEGER,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        directory TEXT
+      )
+    `)
   }
 
   private hasColumn(table: string, column: string): boolean {
@@ -241,6 +355,133 @@ export class JobStore {
     return this.db.query("DELETE FROM job_runs WHERE id = ?").run(id).changes > 0
   }
 
+  // The plugin registers the opencode server URL for its directory so the MCP
+  // server can read a running session's output over HTTP.
+  setInstance(directory: string, url: string): void {
+    this.db
+      .query(
+        "INSERT INTO instances (directory, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(directory) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at",
+      )
+      .run(directory, url, Date.now())
+  }
+
+  instanceURL(directory: string): string | undefined {
+    const row = this.db.query("SELECT url FROM instances WHERE directory = ?").get(directory) as { url: string } | null
+    return row?.url
+  }
+
+  hasInstance(directory: string): boolean {
+    return this.db.query("SELECT 1 FROM instances WHERE directory = ? LIMIT 1").get(directory) !== null
+  }
+
+  requestSessionPeek(directory: string, sessionID: string): string {
+    const id = `peek-${randomSuffix()}`
+    this.db
+      .query("INSERT INTO session_peeks (id, directory, session_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)")
+      .run(id, directory, sessionID, Date.now())
+    return id
+  }
+
+  sessionPeek(id: string): SessionPeek | undefined {
+    const row = this.db.query("SELECT * FROM session_peeks WHERE id = ?").get(id) as PeekRow | null
+    return row ? toPeek(row) : undefined
+  }
+
+  // Called by tests and the plugin's raw SQL counterpart; the server only reads.
+  answerSessionPeek(id: string, result: { text: string; running: boolean; messages: number } | { error: string }): void {
+    if ("error" in result) {
+      this.db
+        .query("UPDATE session_peeks SET status = 'error', error = ?, answered_at = ? WHERE id = ?")
+        .run(result.error, Date.now(), id)
+      return
+    }
+    this.db
+      .query("UPDATE session_peeks SET status = 'done', text = ?, running = ?, messages = ?, answered_at = ? WHERE id = ?")
+      .run(result.text, result.running ? 1 : 0, result.messages, Date.now(), id)
+  }
+
+  deleteSessionPeek(id: string): void {
+    this.db.query("DELETE FROM session_peeks WHERE id = ?").run(id)
+  }
+
+  pendingSessionPeeks(directory: string, limit = 10): { id: string; session_id: string }[] {
+    return this.db
+      .query("SELECT id, session_id FROM session_peeks WHERE status = 'pending' AND directory = ? ORDER BY created_at LIMIT ?")
+      .all(directory, limit) as { id: string; session_id: string }[]
+  }
+
+  pruneSessionPeeks(olderThanMs: number): number {
+    return this.db.query("DELETE FROM session_peeks WHERE created_at < ?").run(Date.now() - olderThanMs).changes
+  }
+
+  runsDir(): string {
+    return this.detachedDir
+  }
+
+  detachedLogPath(id: string): string {
+    return join(this.detachedDir, `${id}.log`)
+  }
+
+  detachedExitPath(id: string): string {
+    return join(this.detachedDir, `${id}.exit`)
+  }
+
+  detachedStopPath(id: string): string {
+    return join(this.detachedDir, `${id}.stop`)
+  }
+
+  createDetached(run: DetachedRunInput): void {
+    this.db
+      .query(
+        "INSERT OR REPLACE INTO detached_runs (id, command, cwd, pid, status, exit_code, started_at, ended_at, directory) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(run.id, run.command, run.cwd ?? null, run.pid, run.status, run.exit_code, run.started_at, run.ended_at, run.directory ?? null)
+  }
+
+  detached(id: string): DetachedRun | undefined {
+    const row = this.db.query("SELECT * FROM detached_runs WHERE id = ?").get(id) as DetachedRow | null
+    return row ? toDetached(row) : undefined
+  }
+
+  listDetached(limit = 100): DetachedRun[] {
+    const rows = this.db.query("SELECT * FROM detached_runs ORDER BY started_at LIMIT ?").all(limit) as DetachedRow[]
+    return rows.map(toDetached)
+  }
+
+  updateDetached(id: string, patch: DetachedRunPatch): void {
+    const current = this.detached(id)
+    if (!current) return
+    this.db
+      .query("UPDATE detached_runs SET status = ?, exit_code = ?, ended_at = ? WHERE id = ?")
+      .run(
+        patch.status ?? current.status,
+        patch.exit_code !== undefined ? patch.exit_code : current.exit_code,
+        patch.ended_at !== undefined ? patch.ended_at : current.ended_at,
+        id,
+      )
+  }
+
+  // Removes finished rows past the cutoff and their log and marker files. A job
+  // still marked running is left in place however old it is.
+  pruneDetached(olderThanMs: number): number {
+    const rows = this.db
+      .query("SELECT id, status FROM detached_runs WHERE COALESCE(ended_at, started_at) < ?")
+      .all(Date.now() - olderThanMs) as { id: string; status: string }[]
+    const removable = rows.filter((row) => row.status !== "running")
+    let changes = 0
+    for (const row of removable) {
+      for (const path of [this.detachedLogPath(row.id), this.detachedExitPath(row.id), this.detachedStopPath(row.id)]) {
+        try {
+          rmSync(path, { force: true })
+        } catch {
+          // best effort: a missing or locked file must not block the prune
+        }
+      }
+      changes += this.db.query("DELETE FROM detached_runs WHERE id = ?").run(row.id).changes
+    }
+    return changes
+  }
+
   pruneRuns(olderThanMs: number): number {
     return this.db.query("DELETE FROM job_runs WHERE ended_at < ?").run(Date.now() - olderThanMs).changes
   }
@@ -292,6 +533,35 @@ function toRun(row: RunRow): JobRun {
     started_at: row.started_at,
     ended_at: row.ended_at,
     directory: row.directory ?? undefined,
+  }
+}
+
+function toDetached(row: DetachedRow): DetachedRun {
+  return {
+    id: row.id,
+    command: row.command,
+    cwd: row.cwd ?? undefined,
+    pid: row.pid,
+    status: row.status,
+    exit_code: row.exit_code,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    directory: row.directory ?? undefined,
+  }
+}
+
+function toPeek(row: PeekRow): SessionPeek {
+  return {
+    id: row.id,
+    directory: row.directory,
+    session_id: row.session_id,
+    status: row.status as SessionPeek["status"],
+    text: row.text ?? undefined,
+    running: row.running === null ? undefined : row.running === 1,
+    messages: row.messages ?? undefined,
+    error: row.error ?? undefined,
+    created_at: row.created_at,
+    answered_at: row.answered_at ?? undefined,
   }
 }
 

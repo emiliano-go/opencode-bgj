@@ -21,11 +21,23 @@ interface RunRow {
   directory: string | null
 }
 
+interface PeekRow {
+  id: string
+  session_id: string
+}
+
+type MessageEntry = {
+  info?: { role?: string; time?: { completed?: number } }
+  parts?: { type?: string; text?: string; synthetic?: boolean }[]
+}
+
 interface PluginInput {
   directory?: string
+  serverUrl?: URL
   client: {
     session: {
       promptAsync: (options: { path: { id: string }; body: { parts: unknown[] } }) => Promise<unknown>
+      messages?: (options: { path: { id: string } }) => Promise<unknown>
     }
     tui?: {
       showToast?: (options: {
@@ -70,6 +82,25 @@ function durationLabel(row: RunRow): string {
   return `${seconds.toFixed(1)}s`
 }
 
+function unwrap(response: unknown): unknown {
+  if (response && typeof response === "object" && "data" in response) {
+    const data = (response as { data?: unknown }).data
+    if (data !== undefined) return data
+    const error = (response as { error?: unknown }).error
+    if (error) throw new Error(typeof error === "string" ? error : JSON.stringify(error))
+  }
+  return response
+}
+
+function latestText(entries: MessageEntry[]): string {
+  const last = entries.findLast((entry) => entry.info?.role === "assistant")
+  if (!last) return ""
+  return (last.parts ?? [])
+    .filter((part) => part.type === "text" && part.synthetic !== true && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("")
+}
+
 // Bridges background jobs to the agent: the MCP server writes finished runs to
 // the central jobs.db, and this plugin injects them as visible session messages
 // (which both wake an idle session and leave a persistent record in the chat),
@@ -77,6 +108,9 @@ function durationLabel(row: RunRow): string {
 // Runs are matched by the instance directory so a job started in one project is
 // only ever delivered to that project; within a project, the most recently
 // active session receives it.
+// It also answers session_peeks rows: the MCP server is a separate process and
+// cannot read a session, so bgj_output(session_id) files a request and this
+// plugin, which runs inside opencode, reads the session and writes the answer.
 // ponytail: notifies the most recently active session in the directory. Tag
 // runs with a session id if multiple concurrent sessions need their own
 // notifications.
@@ -84,9 +118,47 @@ export default async function bgjNotify(input: PluginInput) {
   const directory = input.directory
   let sessionID: string | undefined
   let polling = false
+  let registered = false
+
+  const registerInstance = (db: Database) => {
+    if (registered || !directory) return
+    db.exec("CREATE TABLE IF NOT EXISTS instances (directory TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    db.query(
+      "INSERT INTO instances (directory, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(directory) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at",
+    ).run(directory, input.serverUrl?.toString() ?? "", Date.now())
+    registered = true
+  }
+
+  const servicePeeks = async (db: Database) => {
+    if (!directory || !input.client.session.messages) return
+    const rows = db
+      .query("SELECT id, session_id FROM session_peeks WHERE status = 'pending' AND directory = ? ORDER BY created_at LIMIT 10")
+      .all(directory) as PeekRow[]
+    for (const row of rows) {
+      try {
+        const entries = (unwrap(await input.client.session.messages({ path: { id: row.session_id } })) ?? []) as MessageEntry[]
+        const list = Array.isArray(entries) ? entries : []
+        const last = list[list.length - 1]
+        const running = last?.info?.role === "assistant" && last.info.time?.completed === undefined
+        db.query("UPDATE session_peeks SET status = 'done', text = ?, running = ?, messages = ?, answered_at = ? WHERE id = ?").run(
+          latestText(list),
+          running ? 1 : 0,
+          list.length,
+          Date.now(),
+          row.id,
+        )
+      } catch (error) {
+        db.query("UPDATE session_peeks SET status = 'error', error = ?, answered_at = ? WHERE id = ?").run(
+          error instanceof Error ? error.message : String(error),
+          Date.now(),
+          row.id,
+        )
+      }
+    }
+  }
 
   const poll = async () => {
-    if (polling || !sessionID || !directory) return
+    if (polling || !directory) return
     const path = databasePath()
     if (!existsSync(path)) return
     polling = true
@@ -94,6 +166,9 @@ export default async function bgjNotify(input: PluginInput) {
     try {
       db = new Database(path)
       db.exec("PRAGMA busy_timeout = 3000")
+      registerInstance(db)
+      await servicePeeks(db)
+      if (!sessionID) return
       const rows = db
         .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 AND directory = ? ORDER BY ended_at LIMIT 20")
         .all(directory) as RunRow[]

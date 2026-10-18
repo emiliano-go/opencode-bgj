@@ -26,6 +26,8 @@ with `bgj_`.
 - Save reusable job definitions with pre-set cwd, env, shell, timeout, and
   arbitrary JSON metadata.
 - Full CRUD over definitions plus `run_job` to invoke one by name.
+- `run_detached` to run a command that outlives the session, with its output and
+  status kept on disk so it stays inspectable.
 - Report finished jobs back to the agent through a companion plugin.
 - Jobs run detached in their own process group.
 
@@ -36,11 +38,29 @@ with `bgj_`.
 | Tool | Input | Output |
 |---|---|---|
 | `start` | `{ command, cwd?, env?, shell?, timeout_ms?, notify? }` | job info |
+| `run_detached` | `{ command, cwd?, env?, shell? }` | job info, `detached: true`, `log` |
 | `list` | `{ active_only? }` | `{ jobs: [...] }` |
 | `status` | `{ job_id }` | job info |
-| `output` | `{ job_id, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
+| `output` | `{ job_id?, session_id?, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
 | `stop` | `{ job_id, signal? }` | job info |
 | `wait` | `{ job_id, timeout_s? }` | `{ job, timed_out }` |
+
+`output` reads the current output of a job. Pass `job_id` for a shell job (the
+merged stdout and stderr buffer, sliced by `tail_bytes` or `offset`), or
+`session_id` to read what a running opencode session has produced so far, for
+example a background subagent. A session read returns the latest assistant
+message text, whether the session is still running, and its message count. Pass
+exactly one of the two ids.
+
+`run_detached` starts a command fully detached in its own session so it keeps
+running after opencode exits, and it never sends a completion notification:
+fire-and-forget. Its merged stdout and stderr go to a per-job log file and its
+exit status is kept on disk, so `status`, `output`, and `stop` still work on it
+later, even in a new session. `list` includes detached jobs, flagged
+`detached: true`, alongside the in-memory ones. Use it for a long download, a
+build, or a server you want to survive a restart; use `start` for work you want
+to observe and be woken about inside this session. There is no `timeout_ms`:
+nothing stays resident to enforce one.
 
 ### Persistent job definitions
 
@@ -70,8 +90,9 @@ shared by every project and session:
 The directory follows `$XDG_DATA_HOME` when set. Override the full path with the
 `OPENCODE_BGJ_DB` environment variable (useful for tests or an alternate
 location). The database is opened in WAL mode so concurrent servers do not block
-each other. Runtime jobs are not stored; only definitions and the completion log
-are persistent.
+each other. Detached job logs and exit markers live beside it in a `runs/`
+directory, overridable with `OPENCODE_BGJ_RUNS`. Runtime jobs are not stored;
+only definitions, the completion log, and detached job state are persistent.
 
 ## Completion notifications
 
@@ -125,8 +146,9 @@ Caveats:
 - `wait` blocks until the job reaches a terminal status or `timeout_s` elapses,
   returning `timed_out` to signal the latter.
 - Runtime jobs are in-memory only. They live as long as the opencode session and
-  stop with the MCP server. Job definitions and the completion log persist in the
-  central database.
+  stop with the MCP server. Detached jobs are the exception: they keep running
+  after the server exits and their output and status persist on disk. Job
+  definitions and the completion log persist in the central database.
 
 ### Runtime job info
 
@@ -140,6 +162,9 @@ Every runtime job info object contains:
 - `exit_code`: the exit code, or `null` while running.
 - `started_at` and `ended_at`: epoch milliseconds.
 - `error`: present only when the process could not be spawned.
+
+A detached job also carries `detached: true` and `log`, the path to its output
+file. It can never be `timed_out`, and `killed` means it was stopped on request.
 
 ### Job definition info
 
@@ -181,21 +206,39 @@ Add the following to your `opencode.json` or `opencode.jsonc`:
 ```
 
 An example is provided in `opencode.example.json`. After restarting opencode, the
-tools appear as `bgj_start`, `bgj_create_job`, `bgj_list_jobs`, and so on.
+tools appear as `bgj_start`, `bgj_run_detached`, `bgj_create_job`, and so on.
 
 ## Project layout
 
 ```
-src/jobs.ts          JobManager: spawn, track, capture output, stop, wait
-src/store.ts         JobStore: centralized SQLite definitions and run log
+src/jobs.ts          JobManager: in-memory spawn, track, capture output, stop, wait
+src/detached.ts      DetachedManager: sessions that outlive the server, log on disk
+src/store.ts         JobStore: centralized SQLite definitions, run log, detached state
 src/tools.ts         Tool schemas and the pure dispatch function
 src/index.ts         MCP server wiring, stdio transport, run log callback
 plugin/bgj-notify.ts opencode plugin that delivers finished runs to the agent
 test/jobs.test.ts    JobManager unit tests
+test/detached.test.ts DetachedManager unit tests
 test/store.test.ts   JobStore CRUD, run log, and persistence tests
 test/tools.test.ts   Tool dispatch unit tests
 test/plugin.test.ts  Plugin delivery test
 ```
+
+## Background agents
+
+opencode can run subagents in the background itself, gated behind an
+experimental flag. Enable it with the environment variable
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` (it is read from the
+environment only; there is no `opencode.json` key). The `task` tool then accepts
+`background: true`: it returns immediately and injects the subagent's result as
+a message when it finishes.
+
+To check on a background subagent before it finishes, call `output` with its
+session id, the task id the `task` tool reported. The MCP server runs in a
+separate process and cannot read a session itself, so it files a request in the
+central database and the plugin, which runs inside opencode, reads the session
+and writes the answer back; `output` waits briefly for it. Without the plugin,
+`output` with a `session_id` returns an error telling you to install it.
 
 ## Why not opencode's built-in BackgroundJob?
 

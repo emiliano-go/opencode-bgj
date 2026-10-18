@@ -2,6 +2,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
 import pkg from "../package.json" with { type: "json" }
+import { DetachedManager } from "./detached"
 import { JobManager } from "./jobs"
 import type { JobRunInput } from "./store"
 import { JobStore } from "./store"
@@ -28,9 +29,13 @@ let store: JobStore | undefined
 try {
   store = new JobStore()
   store.pruneRuns(24 * 60 * 60 * 1000)
+  store.pruneSessionPeeks(24 * 60 * 60 * 1000)
+  store.pruneDetached(24 * 60 * 60 * 1000)
 } catch (error) {
   log(`persistent job store unavailable: ${reason(error)}`)
 }
+
+const detached = store ? new DetachedManager(store) : undefined
 
 // opencode spawns stdio servers with cwd set to the instance directory, so this
 // identifies the project a run belongs to and lets the plugin deliver the
@@ -70,7 +75,7 @@ const server = new Server({ name: "opencode-bgj", version: pkg.version }, { capa
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) =>
-  dispatch(jobs, store, request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>),
+  dispatch(jobs, store, detached, request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>, directory),
 )
 
 function shutdown(signal: string) {

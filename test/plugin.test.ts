@@ -65,6 +65,9 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
         prompts.push(options.body.parts[0].text)
         return {}
       },
+      messages: async (_options: { path: { id: string } }) => ({
+        data: [{ info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "peeked" }] }],
+      }),
     },
     tui: {
       showToast: async (options: { body: { message: string } }) => {
@@ -75,7 +78,9 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   }
 
   const mod = await import("../plugin/bgj-notify")
-  const hooks = (await mod.default({ client, directory: "/proj/test" })) as { event: (input: any) => Promise<void> }
+  const hooks = (await mod.default({ client, directory: "/proj/test", serverUrl: new URL("http://127.0.0.1:1234") })) as {
+    event: (input: any) => Promise<void>
+  }
   await hooks.event({ event: { properties: { sessionID: "ses_test" } } })
 
   for (let i = 0; i < 200 && prompts.length === 0; i++) await Bun.sleep(20)
@@ -92,5 +97,13 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   const check = new JobStore(dbPath)
   expect(check.pendingRuns("/proj/test")).toHaveLength(0)
   expect(check.pendingRuns("/proj/other").map((run) => run.id)).toEqual(["bgj-other"])
+  expect(check.instanceURL("/proj/test")).toBe("http://127.0.0.1:1234/")
+
+  const peekID = check.requestSessionPeek("/proj/test", "ses_peek")
+  for (let i = 0; i < 200 && check.sessionPeek(peekID)?.status === "pending"; i++) await Bun.sleep(20)
+  const peek = check.sessionPeek(peekID)
+  expect(peek?.status).toBe("done")
+  expect(peek?.text).toBe("peeked")
+  expect(peek?.messages).toBe(1)
   check.close()
 })

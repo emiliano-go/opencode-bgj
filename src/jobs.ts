@@ -50,8 +50,8 @@ const KILL_GRACE_MS = 5_000
 const DEFAULT_SHELL = "/bin/sh"
 
 // ponytail: in-memory only. Jobs die with this process (the MCP server, a child
-// of opencode). Add a disk+detached slice with an exit-code marker if jobs must
-// outlive the session.
+// of opencode). Use run_detached (src/detached.ts) for jobs that must outlive
+// the session; it keeps output and status on disk instead of in this map.
 export class JobManager {
   private readonly jobs = new Map<string, Entry>()
 

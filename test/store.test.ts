@@ -121,6 +121,44 @@ describe("JobStore", () => {
     expect(() => store.close()).not.toThrow()
   })
 
+  test("instances register one server URL per directory", () => {
+    const store = new JobStore(":memory:")
+    expect(store.instanceURL("/proj/a")).toBeUndefined()
+    expect(store.hasInstance("/proj/a")).toBe(false)
+    store.setInstance("/proj/a", "http://127.0.0.1:1")
+    store.setInstance("/proj/a", "http://127.0.0.1:2")
+    expect(store.instanceURL("/proj/a")).toBe("http://127.0.0.1:2")
+    expect(store.hasInstance("/proj/a")).toBe(true)
+    expect(store.instanceURL("/proj/b")).toBeUndefined()
+  })
+
+  test("session peeks round-trip, answer, and delete", () => {
+    const store = new JobStore(":memory:")
+    const id = store.requestSessionPeek("/proj", "ses_1")
+    expect(store.sessionPeek(id)).toMatchObject({ status: "pending", session_id: "ses_1", directory: "/proj" })
+    expect(store.pendingSessionPeeks("/proj").map((peek) => peek.id)).toEqual([id])
+    expect(store.pendingSessionPeeks("/other")).toHaveLength(0)
+
+    store.answerSessionPeek(id, { text: "hi", running: false, messages: 2 })
+    expect(store.sessionPeek(id)).toMatchObject({ status: "done", text: "hi", running: false, messages: 2 })
+    expect(store.pendingSessionPeeks("/proj")).toHaveLength(0)
+
+    store.deleteSessionPeek(id)
+    expect(store.sessionPeek(id)).toBeUndefined()
+  })
+
+  test("session peeks record an error and prune by age", async () => {
+    const store = new JobStore(":memory:")
+    const id = store.requestSessionPeek("/proj", "ses_1")
+    store.answerSessionPeek(id, { error: "boom" })
+    expect(store.sessionPeek(id)).toMatchObject({ status: "error", error: "boom" })
+
+    expect(store.pruneSessionPeeks(60_000)).toBe(0)
+    await Bun.sleep(5)
+    expect(store.pruneSessionPeeks(0)).toBe(1)
+    expect(store.sessionPeek(id)).toBeUndefined()
+  })
+
   test("defaultDatabasePath honours OPENCODE_BGJ_DB", () => {
     const previous = process.env.OPENCODE_BGJ_DB
     process.env.OPENCODE_BGJ_DB = "/custom/jobs.db"
