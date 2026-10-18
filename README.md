@@ -115,9 +115,11 @@ The flow is:
    `job_runs` table in the central database, tagged with the instance directory
    that started it.
 2. A companion opencode plugin, `plugin/bgj-notify.ts`, polls that table and
-   injects each result into the session as a message, and shows a TUI toast. It
-   claims only runs whose directory matches its own, so a job started in one
-   project is never delivered to another.
+   injects each result into the session that started the job as a message, and
+   shows a TUI toast. It claims only runs whose directory matches its own, so a
+   job started in one project is never delivered to another, and it remembers
+   the starting session per job so concurrent sessions each get their own.
+   See the caveats below for the fallback.
 3. Injecting a message starts a turn, so an idle agent wakes up and can act on
    the result.
 
@@ -140,9 +142,13 @@ until pruned on the next server start (runs older than 24 hours are removed).
 Caveats:
 
 - The plugin only runs while opencode is running.
-- It delivers to the most recently active session within the instance directory.
-  With several concurrent sessions in the same directory, notifications are not
-  routed per session.
+- It delivers each finished job to the session that started it: the plugin sees
+  the `bgj_start`/`bgj_run_job` result through the `tool.execute.after` hook and
+  remembers the job's session, so concurrent sessions in one directory each get
+  their own completions. If a run's session is unknown (for example the start
+  call was never observed), it falls back to the most recently active session in
+  the directory. The mapping lives in memory and is only needed while opencode
+  runs, since a runtime job can only finish then.
 - The plugin, the server, and any pruner must agree on the database path, so set
   `OPENCODE_BGJ_DB` consistently if you override it.
 
@@ -170,6 +176,10 @@ Every runtime job info object contains:
 - `status`: one of `running`, `completed`, `failed`, `timed_out`, `killed`.
 - `exit_code`: the exit code, or `null` while running.
 - `started_at` and `ended_at`: epoch milliseconds.
+- `elapsed_ms`: how long the job has been running in milliseconds; once it
+  finishes this is its total duration (`ended_at - started_at`), otherwise the
+  time so far. Shown by `start`, `status`, `list`, `output`, `wait`,
+  `run_job`, and `run_detached`.
 - `error`: present only when the process could not be spawned.
 
 A detached job also carries `detached: true` and `log`, the path to its output

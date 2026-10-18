@@ -116,23 +116,48 @@ function latestText(entries: MessageEntry[]): string {
     .join("")
 }
 
+// tool.execute.after hands us the raw MCP CallToolResult: our start tools put the
+// job id in structuredContent, with the text content as a JSON fallback.
+function jobIdFromResult(output: unknown): string | undefined {
+  if (!output || typeof output !== "object") return undefined
+  const structured = (output as { structuredContent?: { job_id?: unknown } }).structuredContent
+  if (typeof structured?.job_id === "string") return structured.job_id
+  const content = (output as { content?: { text?: unknown }[] }).content
+  const text = Array.isArray(content) ? content.find((item) => typeof item?.text === "string")?.text : undefined
+  if (typeof text !== "string") return undefined
+  try {
+    const parsed = JSON.parse(text) as { job_id?: unknown }
+    return typeof parsed?.job_id === "string" ? parsed.job_id : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const START_TOOL = /_start$|_run_job$/
+
 // Bridges background jobs to the agent: the MCP server writes finished runs to
 // the central jobs.db, and this plugin injects them as visible session messages
 // (which both wake an idle session and leave a persistent record in the chat),
 // plus a TUI toast for immediate feedback.
 // Runs are matched by the instance directory so a job started in one project is
-// only ever delivered to that project; within a project, the most recently
-// active session receives it.
+// only ever delivered to that project. Within a project the MCP server cannot
+// learn which session started a job (opencode sends no session id to MCP), so
+// this plugin watches the bgj start tools through tool.execute.after, remembers
+// job_id -> sessionID, and delivers each completion to the session that started
+// it. The most recently active session is only the fallback.
 // It also answers session_requests rows: the MCP server is a separate process and
 // cannot read or control a session, so the session tools file a request (op is
 // peek, status, list, or abort) and this plugin, which runs inside opencode,
 // answers it: peek/status read the latest assistant text, list returns the
 // directory's child sessions (background subagents), abort cancels a session.
-// ponytail: notifies the most recently active session in the directory. Tag
-// runs with a session id if multiple concurrent sessions need their own
-// notifications.
+// ponytail: the job_id -> session map lives in memory. A runtime job can only
+// finish while opencode (and this plugin) is alive, so it never needs to survive
+// a restart; prune it if that ever changes.
+const JOB_SESSION_TTL_MS = 60 * 60 * 1000
+
 export default async function bgjNotify(input: PluginInput) {
   const directory = input.directory
+  const jobSessions = new Map<string, { session: string; at: number }>()
   let sessionID: string | undefined
   let polling = false
   let registered = false
@@ -208,6 +233,8 @@ export default async function bgjNotify(input: PluginInput) {
 
   const poll = async () => {
     if (polling || !directory) return
+    const cutoff = Date.now() - JOB_SESSION_TTL_MS
+    for (const [id, entry] of jobSessions) if (entry.at < cutoff) jobSessions.delete(id)
     const path = databasePath()
     if (!existsSync(path)) return
     polling = true
@@ -217,18 +244,19 @@ export default async function bgjNotify(input: PluginInput) {
       db.exec("PRAGMA busy_timeout = 3000")
       registerInstance(db)
       await serviceRequests(db)
-      if (!sessionID) return
       const rows = db
         .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 AND directory = ? ORDER BY ended_at LIMIT 20")
         .all(directory) as RunRow[]
       for (const row of rows) {
-        const id = sessionID
+        const target = jobSessions.get(row.id)?.session ?? sessionID
+        if (!target) continue
         try {
-          const res: unknown = await input.client.session.promptAsync({ path: { id }, body: { parts: [{ type: "text", text: render(row) }] } })
+          const res: unknown = await input.client.session.promptAsync({ path: { id: target }, body: { parts: [{ type: "text", text: render(row) }] } })
           if (res && typeof res === "object" && "error" in res && (res as { error?: unknown }).error) {
             throw new Error(`promptAsync returned an error: ${JSON.stringify((res as { error?: unknown }).error)}`)
           }
           db.query("DELETE FROM job_runs WHERE id = ?").run(row.id)
+          jobSessions.delete(row.id)
           try {
             await input.client.tui?.showToast?.({
               body: {
@@ -266,6 +294,19 @@ export default async function bgjNotify(input: PluginInput) {
     event: async ({ event }: EventInput) => {
       const id = event?.properties?.sessionID
       if (typeof id === "string" && id.length > 0) sessionID = id
+    },
+    // Record which session started a job so its completion is delivered there.
+    // Never throw: a hook error must not break the tool call.
+    "tool.execute.after": async (hookInput: { tool?: string; sessionID?: string }, output: unknown) => {
+      try {
+        if (!hookInput?.tool || !hookInput?.sessionID) return
+        if (!START_TOOL.test(hookInput.tool)) return
+        const id = jobIdFromResult(output)
+        if (typeof id !== "string" || !id.startsWith("bgj-")) return
+        jobSessions.set(id, { session: hookInput.sessionID, at: Date.now() })
+      } catch {
+        // ignore: routing is best-effort, the directory fallback still works
+      }
     },
   }
 }

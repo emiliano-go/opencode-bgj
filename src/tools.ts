@@ -37,7 +37,7 @@ export const TOOLS = [
     description: `Start a shell command as a background job and return immediately with a job id, without waiting for it to finish. Use it for long-running work (builds, tests, downloads, servers) so you can keep working while it runs.
 The command runs detached in its own process group, so it can be signalled as a group. Its stdout and stderr are captured into one merged buffer in the order produced; only the most recent 1 MiB is kept and older output is dropped.
 By default the job's final status and captured output are reported back to the agent as a message when it finishes, which also wakes an idle session. Set notify to false to suppress that, for example when you intend to call wait yourself.
-Returns the new job's job_id, command, cwd, pid, status ("running"), and started_at. Use status, output, wait, and stop with the returned job_id to inspect or control it.
+Returns the new job's job_id, command, cwd, pid, status ("running"), started_at, and elapsed_ms (milliseconds the job has been running). Use status, output, wait, and stop with the returned job_id to inspect or control it.
 
 Arguments:
 - command: shell command to run, invoked as <shell> -c <command>.
@@ -74,7 +74,7 @@ Arguments:
     name: "list",
     description: `List the background jobs and opencode sessions tracked by this server for the current directory, oldest first (by start time).
 Shell jobs are held in memory only and are lost when the MCP server exits; finished jobs stay listed until then. Sessions come from the bgj-notify plugin: the directory's child sessions (background subagents), so a background subagent shows up here. Detached jobs (run_detached) are included too.
-Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, and error (when the command could not be spawned). Session entries carry session_id, parent_id, title, status ("running" or "completed"), session (true), and running instead. Use the returned id with status, output, wait, and stop.
+Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, elapsed_ms, and error (when the command could not be spawned). Session entries carry session_id, parent_id, title, status ("running" or "completed"), session (true), and running instead. Use the returned id with status, output, wait, and stop.
 Set active_only to true to show only entries that are still running.`,
     inputSchema: {
       type: "object",
@@ -87,7 +87,7 @@ Set active_only to true to show only entries that are still running.`,
     name: "status",
     description: `Get the current state of one background job or session. Pass job_id for a shell or detached job, or session_id for an opencode session (for example a background subagent): a session is "running" while busy and "completed" once idle.
 Use it to poll a running job without blocking, or to check how a finished job ended. Pass exactly one of job_id or session_id.
-For a job, returns job_id, command, cwd, pid, status, exit_code, started_at and ended_at (milliseconds since the Unix epoch), and error when the command could not be spawned. For a session, returns session_id, session (true), status, running, and messages.
+For a job, returns job_id, command, cwd, pid, status, exit_code, started_at and ended_at (milliseconds since the Unix epoch), elapsed_ms (how long it has run, or its total duration once finished), and error when the command could not be spawned. For a session, returns session_id, session (true), status, running, and messages.
 Returns an error result if no job or session with that id is tracked, or if the plugin is not running.`,
     inputSchema: {
       type: "object",
@@ -102,7 +102,7 @@ Returns an error result if no job or session with that id is tracked, or if the 
     description: `Read the current output of a job. Pass job_id for a background shell job, or session_id to read what a running opencode session (for example a background subagent) has produced so far.
 For a shell job both streams are merged in the order produced; the buffer keeps the most recent 1 MiB and tail_bytes or offset select a slice.
 For a session it returns the latest assistant message text, whether the session is still running, and how many messages it has. Pass exactly one of job_id or session_id.
-Returns the id, text, size_bytes (total produced so far, even if some was dropped), and truncated (true when text does not start at the beginning).`,
+Returns the id, text, size_bytes (total produced so far, even if some was dropped), truncated (true when text does not start at the beginning), and, for a shell or detached job, elapsed_ms (how long it has run).`,
     inputSchema: {
       type: "object",
       properties: {
@@ -228,7 +228,7 @@ By default the result is reported back to the agent as a message when the job fi
 Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
 Use it for work that must outlive the session: a long download, a build, or a one-off server you want to survive a restart. For work you want to observe and be woken about inside this session, use start instead.
 There is no timeout_ms: nothing stays resident to enforce one.
-Returns the job_id, command, cwd, pid, status ("running"), started_at, the log file path, and detached ("true").`,
+Returns the job_id, command, cwd, pid, status ("running"), started_at, elapsed_ms (milliseconds it has been running), the log file path, and detached ("true").`,
     inputSchema: {
       type: "object",
       properties: {
@@ -290,9 +290,16 @@ export async function dispatch(
         return withId(args.job_id, (id) => {
           const options = { tailBytes: optionalInt(args.tail_bytes), offset: optionalInt(args.offset) }
           const result = jobs.output(id, options)
-          if (result) return ok({ job_id: id, ...result })
+          if (result) {
+            const info = jobs.status(id)
+            return ok({ job_id: id, ...(info ? { elapsed_ms: elapsedMs(info) } : {}), ...result })
+          }
           const job = detached?.output(id, options)
-          return job ? ok({ job_id: id, ...job }) : unknownJob(id)
+          if (job) {
+            const info = detached?.status(id)
+            return ok({ job_id: id, ...(info ? { elapsed_ms: info.elapsed_ms } : {}), ...job })
+          }
+          return unknownJob(id)
         })
       }
       case "stop": {
@@ -369,8 +376,15 @@ export function toWire(info: JobInfo) {
     exit_code: info.exit_code,
     started_at: info.started_at,
     ended_at: info.ended_at,
+    // Time the job has been running: total duration once finished, otherwise
+    // elapsed so far.
+    elapsed_ms: elapsedMs(info),
     error: info.error,
   })
+}
+
+export function elapsedMs(info: { started_at: number; ended_at: number | null }): number {
+  return Math.max(0, (info.ended_at ?? Date.now()) - info.started_at)
 }
 
 export function toWireDefinition(definition: JobDefinition) {

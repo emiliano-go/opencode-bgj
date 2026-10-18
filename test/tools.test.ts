@@ -27,9 +27,11 @@ describe("runtime tools", () => {
     expect(started.isError).toBeUndefined()
     const id = structured(started).job_id as string
     expect(id).toMatch(/^bgj-/)
+    expect(structured(started).elapsed_ms).toBeGreaterThanOrEqual(0)
 
     const waited = await run("wait", { job_id: id, timeout_s: 5 })
     expect(structured(waited).job.status).toBe("completed")
+    expect(structured(waited).job.elapsed_ms).toBeGreaterThanOrEqual(0)
 
     const out = await run("output", { job_id: id })
     expect(structured(out).text).toBe("dispatched")

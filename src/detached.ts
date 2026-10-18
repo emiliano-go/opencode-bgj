@@ -11,6 +11,7 @@ export interface DetachedStatus {
   exit_code: number | null
   started_at: number
   ended_at: number | null
+  elapsed_ms: number
   log: string
   detached: true
 }
@@ -212,6 +213,7 @@ export class DetachedManager {
       exit_code: row.exit_code,
       started_at: row.started_at,
       ended_at: row.ended_at,
+      elapsed_ms: Math.max(0, (row.ended_at ?? Date.now()) - row.started_at),
       log: this.store.detachedLogPath(row.id),
       detached: true,
     }
