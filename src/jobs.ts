@@ -58,7 +58,7 @@ export class JobManager {
   constructor(private readonly onFinish?: (result: JobResult) => void) {}
 
   start(options: StartOptions): JobInfo {
-    const id = newId()
+    const id = this.newId()
     const cwd = options.cwd ?? process.cwd()
     const info: JobInfo = {
       id,
@@ -166,7 +166,12 @@ export class JobManager {
     const stderr = proc.stderr
     if (stdout && typeof stdout !== "number") pumps.push(pump(stdout, (chunk) => entry.buffer.append(chunk)))
     if (stderr && typeof stderr !== "number") pumps.push(pump(stderr, (chunk) => entry.buffer.append(chunk)))
-    const code = await proc.exited
+    let code: number | null = null
+    try {
+      code = await proc.exited
+    } catch {
+      // reaping failed; record the job as failed instead of leaving it running forever
+    }
     await Promise.allSettled(pumps)
     if (entry.timeoutTimer !== undefined) clearTimeout(entry.timeoutTimer)
     if (entry.info.status === "running") {
@@ -201,6 +206,7 @@ export class JobManager {
 
   private signal(entry: Entry, signal: string) {
     const pid = entry.info.pid
+    if (!Number.isInteger(pid) || pid <= 0) return
     try {
       process.kill(-pid, signal)
     } catch {
@@ -243,6 +249,12 @@ export class JobManager {
     } catch {
       // a store failure must never break job tracking
     }
+  }
+
+  private newId(): string {
+    let id = newId()
+    while (this.jobs.has(id)) id = newId()
+    return id
   }
 }
 

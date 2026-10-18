@@ -47,6 +47,14 @@ describe("runtime tools", () => {
     expect(await run("output", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
   })
 
+  test("malformed argument types are error results, not throws", async () => {
+    const { run } = harness()
+    expect(await run("start", { command: 123 })).toMatchObject({ isError: true })
+    expect(await run("status", { job_id: 42 })).toMatchObject({ isError: true })
+    expect(await run("output", { job_id: [] })).toMatchObject({ isError: true })
+    expect(await run("wait", { job_id: "bgj-x", timeout_s: "soon" })).toMatchObject({ isError: true })
+  })
+
   test("missing required command is an error result", async () => {
     const { run } = harness()
     expect(await run("start", {})).toMatchObject({ isError: true })

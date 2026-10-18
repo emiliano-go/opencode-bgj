@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -82,6 +83,42 @@ describe("JobStore", () => {
     expect(loaded?.id).toBe(created.id)
     expect(loaded?.metadata).toEqual({ k: "v" })
     second.close()
+  })
+
+  test("survives corrupt JSON in stored rows instead of throwing", () => {
+    const path = tempDb()
+    const first = new JobStore(path)
+    const created = first.create({ name: "a", command: "echo a", metadata: { k: "v" } })
+    first.recordRun({
+      id: "bgj-x",
+      command: "true",
+      status: "completed",
+      exit_code: 0,
+      output: "",
+      notify: true,
+      started_at: 1,
+      ended_at: 1,
+      metadata: { k: "v" },
+    })
+    first.close()
+
+    const raw = new Database(path)
+    raw.query("UPDATE job_definitions SET metadata = ? WHERE id = ?").run("{not json", created.id)
+    raw.query("UPDATE job_runs SET metadata = ? WHERE id = ?").run("{not json", "bgj-x")
+    raw.close()
+
+    const second = new JobStore(path)
+    expect(second.get(created.id)?.metadata).toBeUndefined()
+    expect(second.get(created.id)?.name).toBe("a")
+    expect(second.list()).toHaveLength(1)
+    expect(second.pendingRuns()[0]?.metadata).toBeUndefined()
+    second.close()
+  })
+
+  test("close is idempotent", () => {
+    const store = new JobStore(":memory:")
+    store.close()
+    expect(() => store.close()).not.toThrow()
   })
 
   test("defaultDatabasePath honours OPENCODE_BGJ_DB", () => {

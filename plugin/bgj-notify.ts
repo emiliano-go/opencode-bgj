@@ -124,9 +124,10 @@ export default async function bgjNotify(input: PluginInput) {
     }
   }
 
-  const timer = setInterval(() => void poll(), POLL_MS)
+  const onError = (error: unknown) => console.error("opencode-bgj: poll failed:", error)
+  const timer = setInterval(() => void poll().catch(onError), POLL_MS)
   timer.unref?.()
-  void poll()
+  void poll().catch(onError)
 
   return {
     event: async ({ event }: EventInput) => {

@@ -1,17 +1,35 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
+import pkg from "../package.json" with { type: "json" }
 import { JobManager } from "./jobs"
 import type { JobRunInput } from "./store"
 import { JobStore } from "./store"
 import { TOOLS, dispatch } from "./tools"
+
+function log(message: string) {
+  console.error(`opencode-bgj: ${message}`)
+}
+
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+// Never let an unexpected error or a rejected promise take the server down. A
+// dropped MCP server would strand the session, so log and keep serving.
+process.on("uncaughtException", (error) => log(`uncaught exception: ${reason(error)}`))
+process.on("unhandledRejection", (error) => log(`unhandled rejection: ${reason(error)}`))
 
 let store: JobStore | undefined
 try {
   store = new JobStore()
   store.pruneRuns(24 * 60 * 60 * 1000)
 } catch (error) {
-  console.error(`opencode-bgj: persistent job store unavailable: ${error instanceof Error ? error.message : error}`)
+  log(`persistent job store unavailable: ${reason(error)}`)
 }
 
 const jobs = new JobManager((result) => {
@@ -32,14 +50,14 @@ const jobs = new JobManager((result) => {
     definition_name: typeof meta.definition_name === "string" ? meta.definition_name : undefined,
     metadata: isRecord(meta.metadata) ? meta.metadata : undefined,
   }
-  store.recordRun(run)
+  try {
+    store.recordRun(run)
+  } catch (error) {
+    log(`failed to record run ${info.id}: ${reason(error)}`)
+  }
 })
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-const server = new Server({ name: "opencode-bgj", version: "0.3.0" }, { capabilities: { tools: {} } })
+const server = new Server({ name: "opencode-bgj", version: pkg.version }, { capabilities: { tools: {} } })
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
@@ -47,4 +65,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) =>
   dispatch(jobs, store, request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>),
 )
 
-await server.connect(new StdioServerTransport())
+function shutdown(signal: string) {
+  log(`received ${signal}, shutting down`)
+  store?.close()
+  process.exit(0)
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"))
+process.on("SIGTERM", () => shutdown("SIGTERM"))
+process.on("exit", () => store?.close())
+
+try {
+  await server.connect(new StdioServerTransport())
+  log(`ready (v${pkg.version})`)
+} catch (error) {
+  log(`failed to start: ${reason(error)}`)
+  process.exit(1)
+}

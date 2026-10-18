@@ -86,6 +86,7 @@ export function defaultDatabasePath(): string {
 
 export class JobStore {
   private readonly db: Database
+  private closed = false
 
   constructor(path: string = defaultDatabasePath()) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true })
@@ -224,7 +225,13 @@ export class JobStore {
   }
 
   close(): void {
-    this.db.close()
+    if (this.closed) return
+    this.closed = true
+    try {
+      this.db.close()
+    } catch {
+      // already closed, or the connection is gone
+    }
   }
 
   private find(idOrName: string): Row | undefined {
@@ -239,10 +246,10 @@ function toDefinition(row: Row): JobDefinition {
     name: row.name,
     command: row.command,
     cwd: row.cwd ?? undefined,
-    env: row.env ? (JSON.parse(row.env) as Record<string, string>) : undefined,
+    env: parseJson<Record<string, string>>(row.env),
     shell: row.shell ?? undefined,
     timeout_ms: row.timeout_ms ?? undefined,
-    metadata: row.metadata ? (JSON.parse(row.metadata) as Record<string, unknown>) : undefined,
+    metadata: parseJson<Record<string, unknown>>(row.metadata),
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -260,9 +267,18 @@ function toRun(row: RunRow): JobRun {
     output: row.output ?? "",
     notify: row.notify === 1,
     notified: row.notified === 1,
-    metadata: row.metadata ? (JSON.parse(row.metadata) as Record<string, unknown>) : undefined,
+    metadata: parseJson<Record<string, unknown>>(row.metadata),
     started_at: row.started_at,
     ended_at: row.ended_at,
+  }
+}
+
+function parseJson<T>(value: string | null | undefined): T | undefined {
+  if (!value) return undefined
+  try {
+    return JSON.parse(value) as T
+  } catch {
+    return undefined
   }
 }
 
