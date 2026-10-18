@@ -84,7 +84,7 @@ The flow is:
 1. When a job reaches a terminal status, the MCP server writes a row to the
    `job_runs` table in the central database.
 2. A companion opencode plugin, `plugin/bgj-notify.ts`, polls that table and
-   injects each result into the session as a synthetic message.
+   injects each result into the session as a message, and shows a TUI toast.
 3. Injecting a message starts a turn, so an idle agent wakes up and can act on
    the result.
 
