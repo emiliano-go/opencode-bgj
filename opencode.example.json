@@ -1,0 +1,9 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bgj": {
+      "type": "local",
+      "command": ["bun", "run", "/path/to/opencode-bgj/src/index.ts"]
+    }
+  }
+}
