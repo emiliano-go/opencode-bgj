@@ -5,6 +5,12 @@ import { join } from "node:path"
 
 const POLL_MS = Number(process.env.BGJ_POLL_MS ?? 1000)
 const MAX_PREVIEW = 4000
+// Every client call is bounded so a single hung request can never wedge the poll
+// loop. Keep this below the client's mcp_timeout; raise it with
+// OPENCODE_BGJ_DELIVER_TIMEOUT_MS if you raise mcp_timeout.
+const DELIVER_TIMEOUT_MS = positiveNumber(process.env.OPENCODE_BGJ_DELIVER_TIMEOUT_MS, 10_000)
+// A poll that somehow outlives this is treated as stuck and a fresh tick may run.
+const POLL_STALL_MS = Math.max(DELIVER_TIMEOUT_MS * 4, 30_000)
 
 interface RunRow {
   id: string
@@ -31,7 +37,7 @@ interface SessionShape {
   id?: string
   parentID?: string
   title?: string
-  time?: { created?: number }
+  time?: { created?: number; updated?: number }
 }
 
 interface SessionStatusShape {
@@ -66,10 +72,47 @@ interface EventInput {
   event: { type?: string; properties?: Record<string, unknown> }
 }
 
+function positiveNumber(value: unknown, fallback: number): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+// Races a client call against a timer so a request that never settles cannot
+// hold the poll loop open forever.
+function withTimeout<T>(work: Promise<T> | T, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms)
+  })
+  return Promise.race([Promise.resolve(work), timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
 function databasePath(): string {
   if (process.env.OPENCODE_BGJ_DB) return process.env.OPENCODE_BGJ_DB
   const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
   return join(base, "opencode-bgj", "jobs.db")
+}
+
+function openDatabase(): Database | undefined {
+  const path = databasePath()
+  if (!existsSync(path)) return undefined
+  const db = new Database(path)
+  db.exec("PRAGMA busy_timeout = 3000")
+  return db
+}
+
+function ensureSchema(db: Database): void {
+  db.exec("CREATE TABLE IF NOT EXISTS instances (directory TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_sessions (
+      job_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      directory TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
 }
 
 function render(row: RunRow): string {
@@ -126,7 +169,7 @@ function jobIdFromResult(output: unknown): string | undefined {
   const text = Array.isArray(content) ? content.find((item) => typeof item?.text === "string")?.text : undefined
   if (typeof text !== "string") return undefined
   try {
-    const parsed = JSON.parse(text) as { job_id?: unknown }
+    const parsed = JSON.parse(text) as { job_id?: string }
     return typeof parsed?.job_id === "string" ? parsed.job_id : undefined
   } catch {
     return undefined
@@ -142,29 +185,28 @@ const START_TOOL = /_start$|_run_job$/
 // Runs are matched by the instance directory so a job started in one project is
 // only ever delivered to that project. Within a project the MCP server cannot
 // learn which session started a job (opencode sends no session id to MCP), so
-// this plugin watches the bgj start tools through tool.execute.after, remembers
-// job_id -> sessionID, and delivers each completion to the session that started
-// it. The most recently active session is only the fallback.
+// this plugin watches the bgj start tools through tool.execute.after and writes
+// job_id -> session to the shared job_sessions table. That mapping is persisted,
+// so a completion still reaches the right session after the plugin or opencode
+// restarts; a run with no mapping falls back to the most recent top-level
+// session in the directory (never a subagent), resolved from session.list rather
+// than a single event, so a backlog drains as soon as the directory is known.
 // It also answers session_requests rows: the MCP server is a separate process and
 // cannot read or control a session, so the session tools file a request (op is
 // peek, status, list, or abort) and this plugin, which runs inside opencode,
 // answers it: peek/status read the latest assistant text, list returns the
 // directory's child sessions (background subagents), abort cancels a session.
-// ponytail: the job_id -> session map lives in memory. A runtime job can only
-// finish while opencode (and this plugin) is alive, so it never needs to survive
-// a restart; prune it if that ever changes.
-const JOB_SESSION_TTL_MS = 60 * 60 * 1000
-
 export default async function bgjNotify(input: PluginInput) {
   const directory = input.directory
-  const jobSessions = new Map<string, { session: string; at: number }>()
   let sessionID: string | undefined
   let polling = false
+  let pollStartedAt = 0
   let registered = false
+  // Runs we could not deliver yet, so the "no session" log is not repeated each poll.
+  const held = new Set<string>()
 
   const registerInstance = (db: Database) => {
     if (registered || !directory) return
-    db.exec("CREATE TABLE IF NOT EXISTS instances (directory TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)")
     db.query(
       "INSERT INTO instances (directory, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(directory) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at",
     ).run(directory, input.serverUrl?.toString() ?? "", Date.now())
@@ -180,7 +222,9 @@ export default async function bgjNotify(input: PluginInput) {
     db.query("UPDATE session_requests SET status = 'error', error = ?, answered_at = ? WHERE id = ?").run(message, Date.now(), id)
 
   const snapshot = async (sessionID: string) => {
-    const entries = (unwrap(await input.client.session.messages!({ path: { id: sessionID } })) ?? []) as MessageEntry[]
+    const entries = (unwrap(
+      await withTimeout(input.client.session.messages!({ path: { id: sessionID } }), DELIVER_TIMEOUT_MS, "session.messages"),
+    ) ?? []) as MessageEntry[]
     const list = Array.isArray(entries) ? entries : []
     const last = list[list.length - 1]
     const running = last?.info?.role === "assistant" && last.info.time?.completed === undefined
@@ -191,9 +235,13 @@ export default async function bgjNotify(input: PluginInput) {
   // listing would include every top-level chat in the project.
   const listSubagents = async () => {
     if (!input.client.session.list || !input.client.session.status) throw new Error("session.list/status unavailable")
-    const raw = (unwrap(await input.client.session.list({ query: { directory } })) ?? []) as SessionShape[]
+    const raw = (unwrap(
+      await withTimeout(input.client.session.list({ query: { directory } }), DELIVER_TIMEOUT_MS, "session.list"),
+    ) ?? []) as SessionShape[]
     const sessions = (Array.isArray(raw) ? raw : []).filter((session) => typeof session.id === "string" && !!session.parentID)
-    const statuses = (unwrap(await input.client.session.status({ query: { directory } })) ?? {}) as Record<string, SessionStatusShape>
+    const statuses = (unwrap(
+      await withTimeout(input.client.session.status({ query: { directory } }), DELIVER_TIMEOUT_MS, "session.status"),
+    ) ?? {}) as Record<string, SessionStatusShape>
     return {
       sessions: sessions.map((session) => ({
         session_id: session.id,
@@ -218,7 +266,7 @@ export default async function bgjNotify(input: PluginInput) {
         }
         if (!row.session_id) throw new Error(`${row.op} requires a session_id`)
         if (row.op === "abort") {
-          await input.client.session.abort?.({ path: { id: row.session_id } })
+          await withTimeout(input.client.session.abort?.({ path: { id: row.session_id } }), DELIVER_TIMEOUT_MS, "session.abort")
           answerRequest(db, row.id, { aborted: true })
           continue
         }
@@ -231,55 +279,106 @@ export default async function bgjNotify(input: PluginInput) {
     }
   }
 
+  // A last-resort target when the directory listing is unavailable; the event
+  // hook keeps it as the session of the most recent event.
+  const newestSession = async (): Promise<string | undefined> => {
+    if (!input.client.session.list) return sessionID
+    try {
+      const raw = (unwrap(
+        await withTimeout(input.client.session.list({ query: { directory } }), DELIVER_TIMEOUT_MS, "session.list"),
+      ) ?? []) as SessionShape[]
+      const sessions = (Array.isArray(raw) ? raw : []).filter((session) => typeof session.id === "string" && !session.parentID)
+      sessions.sort((a, b) => (b.time?.updated ?? b.time?.created ?? 0) - (a.time?.updated ?? a.time?.created ?? 0))
+      return sessions[0]?.id ?? sessionID
+    } catch {
+      return sessionID
+    }
+  }
+
   const poll = async () => {
-    if (polling || !directory) return
-    const cutoff = Date.now() - JOB_SESSION_TTL_MS
-    for (const [id, entry] of jobSessions) if (entry.at < cutoff) jobSessions.delete(id)
-    const path = databasePath()
-    if (!existsSync(path)) return
+    if (!directory) return
+    if (polling && Date.now() - pollStartedAt < POLL_STALL_MS) return
     polling = true
+    pollStartedAt = Date.now()
     let db: Database | undefined
     try {
-      db = new Database(path)
-      db.exec("PRAGMA busy_timeout = 3000")
+      // No database yet (the server has not written one): nothing to do, and the
+      // finally below still clears the guard.
+      db = openDatabase()
+      if (!db) return
+      ensureSchema(db)
       registerInstance(db)
-      await serviceRequests(db)
+      // Session requests are served in their own guarded block so a failure here
+      // can never skip the job notifications below.
+      try {
+        await withTimeout(serviceRequests(db), DELIVER_TIMEOUT_MS, "session requests")
+      } catch (error) {
+        console.error("opencode-bgj: session request handling failed:", error)
+      }
       const rows = db
         .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 AND directory = ? ORDER BY ended_at LIMIT 20")
         .all(directory) as RunRow[]
+      const deadline = Date.now() + DELIVER_TIMEOUT_MS
+      let fallback: string | undefined
+      let fallbackResolved = false
       for (const row of rows) {
-        const target = jobSessions.get(row.id)?.session ?? sessionID
-        if (!target) continue
+        if (Date.now() > deadline) break
+        const mapped = db.query("SELECT session_id FROM job_sessions WHERE job_id = ?").get(row.id) as { session_id: string } | null
+        let target = mapped?.session_id
+        if (!target) {
+          if (!fallbackResolved) {
+            fallback = await newestSession()
+            fallbackResolved = true
+          }
+          target = fallback
+        }
+        if (!target) {
+          if (!held.has(row.id)) {
+            held.add(row.id)
+            console.error(`opencode-bgj: no session known for ${row.id}; holding its completion until one appears`)
+          }
+          continue
+        }
         try {
-          const res: unknown = await input.client.session.promptAsync({ path: { id: target }, body: { parts: [{ type: "text", text: render(row) }] } })
+          const res: unknown = await withTimeout(
+            input.client.session.promptAsync({ path: { id: target }, body: { parts: [{ type: "text", text: render(row) }] } }),
+            DELIVER_TIMEOUT_MS,
+            "promptAsync",
+          )
           if (res && typeof res === "object" && "error" in res && (res as { error?: unknown }).error) {
             throw new Error(`promptAsync returned an error: ${JSON.stringify((res as { error?: unknown }).error)}`)
           }
           db.query("DELETE FROM job_runs WHERE id = ?").run(row.id)
-          jobSessions.delete(row.id)
+          db.query("DELETE FROM job_sessions WHERE job_id = ?").run(row.id)
+          held.delete(row.id)
           try {
-            await input.client.tui?.showToast?.({
-              body: {
-                title: "Background job finished",
-                message: `${jobName(row)} (${row.status}, ${durationLabel(row)})`,
-                variant: row.status === "completed" && (row.exit_code ?? 0) === 0 ? "success" : "error",
-                duration: 8000,
-              },
-            })
+            await withTimeout(
+              input.client.tui?.showToast?.({
+                body: {
+                  title: "Background job finished",
+                  message: `${jobName(row)} (${row.status}, ${durationLabel(row)})`,
+                  variant: row.status === "completed" && (row.exit_code ?? 0) === 0 ? "success" : "error",
+                  duration: 8000,
+                },
+              }),
+              DELIVER_TIMEOUT_MS,
+              "showToast",
+            )
           } catch {
             // no TUI attached (server mode); the wake message still records the completion
           }
         } catch (error) {
+          held.add(row.id)
           console.error(`opencode-bgj: failed to deliver notification for ${row.id}:`, error)
         }
       }
-    } catch {
-      // database missing, table not created yet, or temporarily busy
+    } catch (error) {
+      console.error("opencode-bgj: poll failed:", error)
     } finally {
       try {
         db?.close()
       } catch {
-        // ignore
+        // already closed, or the connection is gone
       }
       polling = false
     }
@@ -295,17 +394,29 @@ export default async function bgjNotify(input: PluginInput) {
       const id = event?.properties?.sessionID
       if (typeof id === "string" && id.length > 0) sessionID = id
     },
-    // Record which session started a job so its completion is delivered there.
-    // Never throw: a hook error must not break the tool call.
+    // Record which session started a job so its completion is delivered there,
+    // even after a restart. Never throw: a hook error must not break the tool call.
     "tool.execute.after": async (hookInput: { tool?: string; sessionID?: string }, output: unknown) => {
       try {
-        if (!hookInput?.tool || !hookInput?.sessionID) return
+        if (!directory || !hookInput?.tool || !hookInput?.sessionID) return
         if (!START_TOOL.test(hookInput.tool)) return
         const id = jobIdFromResult(output)
         if (typeof id !== "string" || !id.startsWith("bgj-")) return
-        jobSessions.set(id, { session: hookInput.sessionID, at: Date.now() })
+        const db = openDatabase()
+        if (!db) return
+        try {
+          ensureSchema(db)
+          db.query("INSERT OR REPLACE INTO job_sessions (job_id, session_id, directory, created_at) VALUES (?, ?, ?, ?)").run(
+            id,
+            hookInput.sessionID,
+            directory,
+            Date.now(),
+          )
+        } finally {
+          db.close()
+        }
       } catch {
-        // ignore: routing is best-effort, the directory fallback still works
+        // routing is best-effort; the top-level session fallback still applies
       }
     },
   }

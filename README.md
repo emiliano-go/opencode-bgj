@@ -117,9 +117,9 @@ The flow is:
 2. A companion opencode plugin, `plugin/bgj-notify.ts`, polls that table and
    injects each result into the session that started the job as a message, and
    shows a TUI toast. It claims only runs whose directory matches its own, so a
-   job started in one project is never delivered to another, and it remembers
-   the starting session per job so concurrent sessions each get their own.
-   See the caveats below for the fallback.
+   job started in one project is never delivered to another, and it records the
+   starting session per job in the `job_sessions` table so concurrent sessions
+   each get their own. See the caveats below for the fallback.
 3. Injecting a message starts a turn, so an idle agent wakes up and can act on
    the result.
 
@@ -144,11 +144,15 @@ Caveats:
 - The plugin only runs while opencode is running.
 - It delivers each finished job to the session that started it: the plugin sees
   the `bgj_start`/`bgj_run_job` result through the `tool.execute.after` hook and
-  remembers the job's session, so concurrent sessions in one directory each get
-  their own completions. If a run's session is unknown (for example the start
-  call was never observed), it falls back to the most recently active session in
-  the directory. The mapping lives in memory and is only needed while opencode
-  runs, since a runtime job can only finish then.
+  persists `job_id` -> session in the shared `job_sessions` table, so concurrent
+  sessions in one directory each get their own completions and the mapping
+  survives a restart. If a run has no mapping (for example the start call was
+  never observed), it falls back to the most recent top-level session in the
+  directory, resolved from `session.list` (subagent sessions are never chosen).
+- Every call the plugin makes is bounded by a timeout so one hung request cannot
+  stall delivery. The default is 10 seconds; set `OPENCODE_BGJ_DELIVER_TIMEOUT_MS`
+  to change it (keep it below the client's `mcp_timeout`). A delivery that times
+  out or errors is retried on the next poll.
 - The plugin, the server, and any pruner must agree on the database path, so set
   `OPENCODE_BGJ_DB` consistently if you override it.
 

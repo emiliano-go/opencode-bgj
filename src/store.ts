@@ -52,6 +52,15 @@ export interface JobRun extends JobRunInput {
 
 export type SessionOp = "peek" | "status" | "list" | "abort"
 
+// The session that started a job, persisted so the plugin can route the job's
+// completion after a restart without waiting for a session event.
+export interface JobSession {
+  job_id: string
+  session_id: string
+  directory: string
+  created_at: number
+}
+
 // A request the MCP server files for the plugin to answer from inside opencode,
 // because the server is a separate process and cannot touch a session itself.
 export interface SessionRequest {
@@ -140,6 +149,13 @@ interface SessionRequestRow {
   answered_at: number | null
 }
 
+interface JobSessionRow {
+  job_id: string
+  session_id: string
+  directory: string
+  created_at: number
+}
+
 // Centralized, shared across every project and session. Override with
 // OPENCODE_BGJ_DB.
 export function defaultDatabasePath(): string {
@@ -204,6 +220,17 @@ export class JobStore {
     if (!this.hasColumn("job_runs", "directory")) this.db.exec("ALTER TABLE job_runs ADD COLUMN directory TEXT")
     this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending ON job_runs (notify, notified, ended_at)")
     this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending_dir ON job_runs (notify, notified, directory, ended_at)")
+    // Which session started a job, written by the plugin from the tool.execute.after
+    // hook. Persisted (unlike an in-memory map) so a completion still reaches the
+    // right session after the plugin, opencode, or the whole machine restarts.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS job_sessions (
+        job_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        directory TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `)
     // Written by the plugin, which knows the opencode server URL; read by the
     // server as a liveness signal for the directory's instance. The TUI runs its
     // server in-process, so the URL is informational and not reachable from here.
@@ -359,6 +386,23 @@ export class JobStore {
     return this.db.query("DELETE FROM job_runs WHERE id = ?").run(id).changes > 0
   }
 
+  // The plugin writes the same row with its own SQL (it runs inside opencode, a
+  // separate runtime); this is the store-side view used by tests.
+  setJobSession(jobId: string, sessionId: string, directory: string): void {
+    this.db
+      .query("INSERT OR REPLACE INTO job_sessions (job_id, session_id, directory, created_at) VALUES (?, ?, ?, ?)")
+      .run(jobId, sessionId, directory, Date.now())
+  }
+
+  jobSession(jobId: string): JobSession | undefined {
+    const row = this.db.query("SELECT * FROM job_sessions WHERE job_id = ?").get(jobId) as JobSessionRow | null
+    return row ?? undefined
+  }
+
+  deleteJobSession(jobId: string): void {
+    this.db.query("DELETE FROM job_sessions WHERE job_id = ?").run(jobId)
+  }
+
   // The plugin registers the opencode server URL for its directory so the MCP
   // server can read a running session's output over HTTP.
   setInstance(directory: string, url: string): void {
@@ -490,7 +534,9 @@ export class JobStore {
   }
 
   pruneRuns(olderThanMs: number): number {
-    return this.db.query("DELETE FROM job_runs WHERE ended_at < ?").run(Date.now() - olderThanMs).changes
+    const cutoff = Date.now() - olderThanMs
+    this.db.query("DELETE FROM job_sessions WHERE created_at < ?").run(cutoff)
+    return this.db.query("DELETE FROM job_runs WHERE ended_at < ?").run(cutoff).changes
   }
 
   close(): void {

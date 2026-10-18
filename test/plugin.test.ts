@@ -8,13 +8,14 @@ const dir = mkdtempSync(join(tmpdir(), "bgj-plugin-"))
 const dbPath = join(dir, "jobs.db")
 process.env.OPENCODE_BGJ_DB = dbPath
 process.env.BGJ_POLL_MS = "20"
+process.env.OPENCODE_BGJ_DELIVER_TIMEOUT_MS = "100"
 
 afterAll(() => {
   process.env.OPENCODE_BGJ_DB = join(dir, "gone.db")
   rmSync(dir, { recursive: true, force: true })
 })
 
-test("plugin delivers only its directory's finished jobs and clears their rows", async () => {
+test("plugin routes finished jobs to their session and survives a stuck delivery", async () => {
   const store = new JobStore(dbPath)
   store.recordRun({
     id: "bgj-plugin1",
@@ -59,21 +60,29 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   const targets: string[] = []
   const parts: any[] = []
   const toasts: string[] = []
+  let hangRetry = 1
   const client = {
     session: {
       promptAsync: async (options: { path: { id: string }; body: { parts: any[] } }) => {
+        const text = options.body.parts[0].text as string
         targets.push(options.path.id)
         parts.push(options.body.parts[0])
-        prompts.push(options.body.parts[0].text)
+        prompts.push(text)
+        // Model a request that never settles: without a timeout this would wedge
+        // the whole poll loop and the retry below would never be delivered.
+        if (text.includes("bgj-retry") && hangRetry-- > 0) return new Promise<never>(() => {})
         return {}
       },
       messages: async (_options: { path: { id: string } }) => ({
         data: [{ info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "peeked" }] }],
       }),
+      // A newer subagent session must never be chosen: only top-level sessions
+      // are valid fallback targets.
       list: async () => ({
         data: [
-          { id: "ses_parent", title: "parent" },
-          { id: "ses_child", parentID: "ses_parent", title: "probe" },
+          { id: "ses_parent", title: "parent", time: { updated: 1 } },
+          { id: "ses_recent", title: "recent", time: { updated: 10 } },
+          { id: "ses_child", parentID: "ses_parent", title: "subagent", time: { updated: 99 } },
         ],
       }),
       status: async () => ({ data: { ses_parent: { type: "idle" }, ses_child: { type: "busy" } } }),
@@ -96,8 +105,9 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
 
   for (let i = 0; i < 200 && prompts.length === 0; i++) await Bun.sleep(20)
 
+  // No mapping for bgj-plugin1, so it falls back to the newest top-level session.
   expect(prompts).toHaveLength(1)
-  expect(targets[0]).toBe("ses_test")
+  expect(targets[0]).toBe("ses_recent")
   expect(prompts[0]).toContain("echo hello from plugin")
   expect(prompts[0]).toContain("hello from plugin")
   expect(prompts[0]).toContain("definition: demo (job-abc)")
@@ -111,7 +121,7 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   expect(check.pendingRuns("/proj/other").map((run) => run.id)).toEqual(["bgj-other"])
   expect(check.instanceURL("/proj/test")).toBe("http://127.0.0.1:1234/")
 
-  // Per-session routing: the tool.execute.after hook maps job_id -> session.
+  // Per-session routing: the tool.execute.after hook persists job_id -> session.
   await hooks["tool.execute.after"]({ tool: "bgj_start", sessionID: "ses_owner" }, { structuredContent: { job_id: "bgj-owned" } })
   await hooks["tool.execute.after"](
     { tool: "bgj_run_job", sessionID: "ses_owner" },
@@ -122,6 +132,10 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   // an id that is not ours is ignored even from a start tool
   await hooks["tool.execute.after"]({ tool: "bgj_start", sessionID: "ses_owner" }, { structuredContent: { job_id: "not-ours" } })
 
+  expect(check.jobSession("bgj-owned")?.session_id).toBe("ses_owner")
+  expect(check.jobSession("bgj-text")?.session_id).toBe("ses_owner")
+  expect(check.jobSession("bgj-ignored")).toBeUndefined()
+
   check.recordRun({ id: "bgj-owned", command: "echo owned", status: "completed", exit_code: 0, output: "owned\n", notify: true, started_at: 1, ended_at: 3, directory: "/proj/test" })
   check.recordRun({ id: "bgj-text", command: "echo text", status: "completed", exit_code: 0, output: "text\n", notify: true, started_at: 1, ended_at: 4, directory: "/proj/test" })
   check.recordRun({ id: "bgj-ignored", command: "echo ignored", status: "completed", exit_code: 0, output: "ignored\n", notify: true, started_at: 1, ended_at: 5, directory: "/proj/test" })
@@ -131,9 +145,18 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
 
   expect(targets[1]).toBe("ses_owner")
   expect(targets[2]).toBe("ses_owner")
-  expect(targets[3]).toBe("ses_test")
-  expect(targets[4]).toBe("ses_test")
+  expect(targets[3]).toBe("ses_recent")
+  expect(targets[4]).toBe("ses_recent")
   expect(toasts).toHaveLength(5)
+  expect(check.jobSession("bgj-owned")).toBeUndefined()
+
+  // A delivery that never settles must not stop later runs: the first attempt for
+  // bgj-retry hangs, the poll times out, and a later poll delivers it.
+  check.recordRun({ id: "bgj-retry", command: "echo retry", status: "completed", exit_code: 0, output: "retry\n", notify: true, started_at: 1, ended_at: 50, directory: "/proj/test" })
+  for (let i = 0; i < 300 && check.pendingRuns("/proj/test").some((run) => run.id === "bgj-retry"); i++) await Bun.sleep(20)
+  expect(hangRetry).toBeLessThan(0)
+  expect(check.pendingRuns("/proj/test").map((run) => run.id)).not.toContain("bgj-retry")
+  expect(prompts.some((prompt) => prompt.includes("bgj-retry"))).toBe(true)
 
   const peekID = check.createSessionRequest("/proj/test", "peek", "ses_peek")
   for (let i = 0; i < 200 && check.sessionRequest(peekID)?.status === "pending"; i++) await Bun.sleep(20)
@@ -144,7 +167,7 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   const listID = check.createSessionRequest("/proj/test", "list")
   for (let i = 0; i < 200 && check.sessionRequest(listID)?.status === "pending"; i++) await Bun.sleep(20)
   expect(check.sessionRequest(listID)?.result).toMatchObject({
-    sessions: [{ session_id: "ses_child", parent_id: "ses_parent", title: "probe", running: true }],
+    sessions: [{ session_id: "ses_child", parent_id: "ses_parent", title: "subagent", running: true }],
   })
 
   const abortID = check.createSessionRequest("/proj/test", "abort", "ses_child")
