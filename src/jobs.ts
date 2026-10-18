@@ -18,6 +18,15 @@ export interface StartOptions {
   env?: Record<string, string>
   shell?: string
   timeout_ms?: number
+  notify?: boolean
+  meta?: Record<string, unknown>
+}
+
+export interface JobResult {
+  info: JobInfo
+  output: string
+  notify: boolean
+  meta?: Record<string, unknown>
 }
 
 export interface OutputOptions {
@@ -46,6 +55,8 @@ const DEFAULT_SHELL = "/bin/sh"
 export class JobManager {
   private readonly jobs = new Map<string, Entry>()
 
+  constructor(private readonly onFinish?: (result: JobResult) => void) {}
+
   start(options: StartOptions): JobInfo {
     const id = newId()
     const cwd = options.cwd ?? process.cwd()
@@ -63,7 +74,15 @@ export class JobManager {
     const exited = new Promise<void>((resolve) => {
       resolveExit = resolve
     })
-    const entry: Entry = { info, buffer: new OutputBuffer(), exited, resolveExit, stopReason: null }
+    const entry: Entry = {
+      info,
+      buffer: new OutputBuffer(),
+      exited,
+      resolveExit,
+      stopReason: null,
+      notify: options.notify ?? true,
+      meta: options.meta,
+    }
     this.jobs.set(id, entry)
 
     let proc: Bun.Subprocess | undefined
@@ -157,6 +176,7 @@ export class JobManager {
         entry.stopReason === "timeout" ? "timed_out" : entry.stopReason === "user" ? "killed" : code === 0 ? "completed" : "failed"
     }
     entry.resolveExit()
+    this.emit(entry)
   }
 
   private armTimeout(entry: Entry, timeoutMs: number) {
@@ -208,6 +228,21 @@ export class JobManager {
     entry.info.error = message
     entry.buffer.append(new TextEncoder().encode(message + "\n"))
     entry.resolveExit()
+    this.emit(entry)
+  }
+
+  private emit(entry: Entry) {
+    if (!this.onFinish) return
+    try {
+      this.onFinish({
+        info: snapshot(entry),
+        output: new TextDecoder().decode(entry.buffer.read(0)),
+        notify: entry.notify,
+        meta: entry.meta,
+      })
+    } catch {
+      // a store failure must never break job tracking
+    }
   }
 }
 
@@ -218,6 +253,8 @@ interface Entry {
   exited: Promise<void>
   resolveExit: () => void
   stopReason: "user" | "timeout" | null
+  notify: boolean
+  meta?: Record<string, unknown>
   timeoutTimer?: ReturnType<typeof setTimeout>
 }
 

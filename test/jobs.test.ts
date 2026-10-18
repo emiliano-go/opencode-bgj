@@ -74,4 +74,19 @@ describe("JobManager", () => {
     expect(job.status).toBe("failed")
     expect(jobs.output(job.id)!.text.length).toBeGreaterThan(0)
   })
+
+  test("invokes the finish callback with output, notify flag and meta", async () => {
+    const results: { status: string; output: string; notify: boolean; meta?: Record<string, unknown> }[] = []
+    const jobs = new JobManager((result) => {
+      results.push({ status: result.info.status, output: result.output, notify: result.notify, meta: result.meta })
+    })
+    const job = jobs.start({ command: "printf finished", notify: false, meta: { definition_name: "demo" } })
+    await jobs.wait(job.id, 5_000)
+
+    expect(results).toHaveLength(1)
+    expect(results[0]!.status).toBe("completed")
+    expect(results[0]!.output).toBe("finished")
+    expect(results[0]!.notify).toBe(false)
+    expect(results[0]!.meta).toEqual({ definition_name: "demo" })
+  })
 })
