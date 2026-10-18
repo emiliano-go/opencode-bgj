@@ -14,7 +14,7 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test("plugin injects a synthetic message for a finished job and clears the row", async () => {
+test("plugin delivers only its directory's finished jobs and clears their rows", async () => {
   const store = new JobStore(dbPath)
   store.recordRun({
     id: "bgj-plugin1",
@@ -29,6 +29,7 @@ test("plugin injects a synthetic message for a finished job and clears the row",
     definition_name: "demo",
     definition_id: "job-abc",
     metadata: { owner: "test" },
+    directory: "/proj/test",
   })
   store.recordRun({
     id: "bgj-silent",
@@ -39,6 +40,18 @@ test("plugin injects a synthetic message for a finished job and clears the row",
     notify: false,
     started_at: 1,
     ended_at: 2,
+    directory: "/proj/test",
+  })
+  store.recordRun({
+    id: "bgj-other",
+    command: "echo elsewhere",
+    status: "completed",
+    exit_code: 0,
+    output: "elsewhere\n",
+    notify: true,
+    started_at: 1,
+    ended_at: 2,
+    directory: "/proj/other",
   })
   store.close()
 
@@ -62,7 +75,7 @@ test("plugin injects a synthetic message for a finished job and clears the row",
   }
 
   const mod = await import("../plugin/bgj-notify")
-  const hooks = (await mod.default({ client })) as { event: (input: any) => Promise<void> }
+  const hooks = (await mod.default({ client, directory: "/proj/test" })) as { event: (input: any) => Promise<void> }
   await hooks.event({ event: { properties: { sessionID: "ses_test" } } })
 
   for (let i = 0; i < 200 && prompts.length === 0; i++) await Bun.sleep(20)
@@ -77,7 +90,7 @@ test("plugin injects a synthetic message for a finished job and clears the row",
   expect(toasts[0]).toContain("demo")
 
   const check = new JobStore(dbPath)
-  expect(check.pendingRuns()).toHaveLength(0)
-  expect(check.list()).toHaveLength(0)
+  expect(check.pendingRuns("/proj/test")).toHaveLength(0)
+  expect(check.pendingRuns("/proj/other").map((run) => run.id)).toEqual(["bgj-other"])
   check.close()
 })

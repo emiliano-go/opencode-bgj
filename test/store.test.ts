@@ -156,6 +156,35 @@ describe("JobStore run log", () => {
     expect(pending[0]!.definition_name).toBe("x")
   })
 
+  test("pendingRuns scopes by directory", () => {
+    const store = new JobStore(":memory:")
+    const base = { command: "true", status: "completed", exit_code: 0, output: "", notify: true, started_at: 1 }
+    store.recordRun({ ...base, id: "bgj-a", ended_at: 1, directory: "/proj/a" })
+    store.recordRun({ ...base, id: "bgj-b", ended_at: 2, directory: "/proj/b" })
+    store.recordRun({ ...base, id: "bgj-c", ended_at: 3, directory: "/proj/a" })
+    store.recordRun({ ...base, id: "bgj-legacy", ended_at: 4 })
+
+    expect(store.pendingRuns("/proj/a").map((run) => run.id)).toEqual(["bgj-a", "bgj-c"])
+    expect(store.pendingRuns("/proj/b").map((run) => run.id)).toEqual(["bgj-b"])
+    expect(store.pendingRuns("/proj/a")[0]!.directory).toBe("/proj/a")
+    expect(store.pendingRuns().map((run) => run.id)).toEqual(["bgj-a", "bgj-b", "bgj-c", "bgj-legacy"])
+  })
+
+  test("migrates a pre-directory job_runs table without losing rows", () => {
+    const path = tempDb()
+    const raw = new Database(path)
+    raw.exec(
+      "CREATE TABLE job_runs (id TEXT PRIMARY KEY, definition_id TEXT, definition_name TEXT, command TEXT NOT NULL, cwd TEXT, status TEXT NOT NULL, exit_code INTEGER, output TEXT, notify INTEGER NOT NULL DEFAULT 1, notified INTEGER NOT NULL DEFAULT 0, metadata TEXT, started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL)",
+    )
+    raw.query("INSERT INTO job_runs (id, command, status, notify, notified, started_at, ended_at) VALUES ('bgj-old', 'true', 'completed', 1, 0, 1, 1)").run()
+    raw.close()
+
+    const store = new JobStore(path)
+    expect(store.pendingRuns("/proj/a")).toHaveLength(0)
+    expect(store.pendingRuns().map((run) => run.id)).toEqual(["bgj-old"])
+    store.close()
+  })
+
   test("deleteRun removes a row and pruneRuns drops old rows", () => {
     const store = new JobStore(":memory:")
     store.recordRun({ id: "bgj-old", command: "true", status: "completed", exit_code: 0, output: "", notify: true, started_at: 1, ended_at: 1 })

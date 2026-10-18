@@ -18,9 +18,11 @@ interface RunRow {
   metadata: string | null
   started_at: number
   ended_at: number
+  directory: string | null
 }
 
 interface PluginInput {
+  directory?: string
   client: {
     session: {
       promptAsync: (options: { path: { id: string }; body: { parts: unknown[] } }) => Promise<unknown>
@@ -72,14 +74,19 @@ function durationLabel(row: RunRow): string {
 // the central jobs.db, and this plugin injects them as visible session messages
 // (which both wake an idle session and leave a persistent record in the chat),
 // plus a TUI toast for immediate feedback.
-// ponytail: notifies the most recently active session. Tag runs with a session
-// id if multiple concurrent sessions need their own notifications.
+// Runs are matched by the instance directory so a job started in one project is
+// only ever delivered to that project; within a project, the most recently
+// active session receives it.
+// ponytail: notifies the most recently active session in the directory. Tag
+// runs with a session id if multiple concurrent sessions need their own
+// notifications.
 export default async function bgjNotify(input: PluginInput) {
+  const directory = input.directory
   let sessionID: string | undefined
   let polling = false
 
   const poll = async () => {
-    if (polling || !sessionID) return
+    if (polling || !sessionID || !directory) return
     const path = databasePath()
     if (!existsSync(path)) return
     polling = true
@@ -87,7 +94,9 @@ export default async function bgjNotify(input: PluginInput) {
     try {
       db = new Database(path)
       db.exec("PRAGMA busy_timeout = 3000")
-      const rows = db.query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 ORDER BY ended_at LIMIT 20").all() as RunRow[]
+      const rows = db
+        .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 AND directory = ? ORDER BY ended_at LIMIT 20")
+        .all(directory) as RunRow[]
       for (const row of rows) {
         const id = sessionID
         try {

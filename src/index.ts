@@ -32,6 +32,13 @@ try {
   log(`persistent job store unavailable: ${reason(error)}`)
 }
 
+// opencode spawns stdio servers with cwd set to the instance directory, so this
+// identifies the project a run belongs to and lets the plugin deliver the
+// completion only to that project's session.
+// ponytail: assumes the default spawn cwd; switch to an MCP roots/list query if
+// a custom mcp.cwd is ever configured.
+const directory = process.cwd()
+
 const jobs = new JobManager((result) => {
   if (!store) return
   const info = result.info
@@ -49,6 +56,7 @@ const jobs = new JobManager((result) => {
     definition_id: typeof meta.definition_id === "string" ? meta.definition_id : undefined,
     definition_name: typeof meta.definition_name === "string" ? meta.definition_name : undefined,
     metadata: isRecord(meta.metadata) ? meta.metadata : undefined,
+    directory,
   }
   try {
     store.recordRun(run)

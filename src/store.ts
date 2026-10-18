@@ -41,6 +41,9 @@ export interface JobRunInput {
   definition_id?: string
   definition_name?: string
   metadata?: Record<string, unknown>
+  // The opencode instance directory the run belongs to, used to route its
+  // completion notification back to the right project. See pendingRuns.
+  directory?: string
 }
 
 export interface JobRun extends JobRunInput {
@@ -61,6 +64,7 @@ interface RunRow {
   metadata: string | null
   started_at: number
   ended_at: number
+  directory: string | null
 }
 
 interface Row {
@@ -121,10 +125,18 @@ export class JobStore {
         notified INTEGER NOT NULL DEFAULT 0,
         metadata TEXT,
         started_at INTEGER NOT NULL,
-        ended_at INTEGER NOT NULL
+        ended_at INTEGER NOT NULL,
+        directory TEXT
       )
     `)
+    if (!this.hasColumn("job_runs", "directory")) this.db.exec("ALTER TABLE job_runs ADD COLUMN directory TEXT")
     this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending ON job_runs (notify, notified, ended_at)")
+    this.db.exec("CREATE INDEX IF NOT EXISTS job_runs_pending_dir ON job_runs (notify, notified, directory, ended_at)")
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    const columns = this.db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    return columns.some((entry) => entry.name === column)
   }
 
   create(input: JobDefinitionInput): JobDefinition {
@@ -191,7 +203,7 @@ export class JobStore {
   recordRun(run: JobRunInput): void {
     this.db
       .query(
-        "INSERT OR REPLACE INTO job_runs (id, definition_id, definition_name, command, cwd, status, exit_code, output, notify, notified, metadata, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        "INSERT OR REPLACE INTO job_runs (id, definition_id, definition_name, command, cwd, status, exit_code, output, notify, notified, metadata, started_at, ended_at, directory) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
       )
       .run(
         run.id,
@@ -206,13 +218,22 @@ export class JobStore {
         run.metadata ? JSON.stringify(run.metadata) : null,
         run.started_at,
         run.ended_at,
+        run.directory ?? null,
       )
   }
 
-  pendingRuns(limit = 50): JobRun[] {
-    const rows = this.db
-      .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 ORDER BY ended_at LIMIT ?")
-      .all(limit) as RunRow[]
+  // Only runs recorded by the requesting instance directory are returned, so a
+  // run started in one project is never delivered to another project's session.
+  // Rows written before the directory column existed (NULL) match no directory
+  // and are left to pruneRuns.
+  pendingRuns(directory?: string, limit = 50): JobRun[] {
+    const rows = (
+      directory === undefined
+        ? this.db.query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 ORDER BY ended_at LIMIT ?").all(limit)
+        : this.db
+            .query("SELECT * FROM job_runs WHERE notify = 1 AND notified = 0 AND directory = ? ORDER BY ended_at LIMIT ?")
+            .all(directory, limit)
+    ) as RunRow[]
     return rows.map(toRun)
   }
 
@@ -270,6 +291,7 @@ function toRun(row: RunRow): JobRun {
     metadata: parseJson<Record<string, unknown>>(row.metadata),
     started_at: row.started_at,
     ended_at: row.ended_at,
+    directory: row.directory ?? undefined,
   }
 }
 

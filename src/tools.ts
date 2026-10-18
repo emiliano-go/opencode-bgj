@@ -95,7 +95,8 @@ Calling stop on a job that has already finished is a no-op and returns its final
   },
   {
     name: "wait",
-    description: `Block until a background job finishes, or until the timeout elapses, then return its final state. Use this instead of polling with status when you need the result before continuing.
+    description: `Block until a background job finishes, or until the timeout elapses, then return its final state.
+Use wait ONLY when you have nothing else to do in the meantime but wait for this job; it suspends the turn until the job ends or timeout_s elapses. If you could be doing other work while the job runs, do NOT call wait: start the job with notify left at its default and continue, and the completion message will wake you when it is done. Never call wait merely to poll for progress.
 Passing timeout_s: 0 returns immediately with the current state. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
 Returns the finished job (or its latest state if the timeout elapsed) and timed_out, which is true when the timeout was reached before the job finished. Errors if the job id is not tracked.`,
     inputSchema: {

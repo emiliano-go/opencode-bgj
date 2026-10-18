@@ -82,15 +82,18 @@ inline.
 The flow is:
 
 1. When a job reaches a terminal status, the MCP server writes a row to the
-   `job_runs` table in the central database.
+   `job_runs` table in the central database, tagged with the instance directory
+   that started it.
 2. A companion opencode plugin, `plugin/bgj-notify.ts`, polls that table and
-   injects each result into the session as a message, and shows a TUI toast.
+   injects each result into the session as a message, and shows a TUI toast. It
+   claims only runs whose directory matches its own, so a job started in one
+   project is never delivered to another.
 3. Injecting a message starts a turn, so an idle agent wakes up and can act on
    the result.
 
 This works because opencode's MCP client cannot push messages into a session on
-its own. Only a plugin can call `client.session.prompt`, the same injection path
-opencode uses for background subagents.
+its own. Only a plugin can call `client.session.promptAsync`, the same injection
+path opencode uses for background subagents.
 
 ### Install the plugin
 
@@ -107,8 +110,9 @@ until pruned on the next server start (runs older than 24 hours are removed).
 Caveats:
 
 - The plugin only runs while opencode is running.
-- It delivers to the most recently active session. With several concurrent
-  sessions, notifications are not routed per session.
+- It delivers to the most recently active session within the instance directory.
+  With several concurrent sessions in the same directory, notifications are not
+  routed per session.
 - The plugin, the server, and any pruner must agree on the database path, so set
   `OPENCODE_BGJ_DB` consistently if you override it.
 
