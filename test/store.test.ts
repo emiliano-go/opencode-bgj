@@ -132,31 +132,34 @@ describe("JobStore", () => {
     expect(store.instanceURL("/proj/b")).toBeUndefined()
   })
 
-  test("session peeks round-trip, answer, and delete", () => {
+  test("session requests round-trip, answer, and delete", () => {
     const store = new JobStore(":memory:")
-    const id = store.requestSessionPeek("/proj", "ses_1")
-    expect(store.sessionPeek(id)).toMatchObject({ status: "pending", session_id: "ses_1", directory: "/proj" })
-    expect(store.pendingSessionPeeks("/proj").map((peek) => peek.id)).toEqual([id])
-    expect(store.pendingSessionPeeks("/other")).toHaveLength(0)
+    const id = store.createSessionRequest("/proj", "peek", "ses_1")
+    expect(store.sessionRequest(id)).toMatchObject({ status: "pending", op: "peek", session_id: "ses_1", directory: "/proj" })
+    const listID = store.createSessionRequest("/proj", "list")
+    expect(store.sessionRequest(listID)).toMatchObject({ status: "pending", op: "list", session_id: undefined })
 
-    store.answerSessionPeek(id, { text: "hi", running: false, messages: 2 })
-    expect(store.sessionPeek(id)).toMatchObject({ status: "done", text: "hi", running: false, messages: 2 })
-    expect(store.pendingSessionPeeks("/proj")).toHaveLength(0)
+    store.answerSessionRequest(id, { text: "hi", running: false, messages: 2 })
+    expect(store.sessionRequest(id)).toMatchObject({
+      status: "done",
+      op: "peek",
+      result: { text: "hi", running: false, messages: 2 },
+    })
 
-    store.deleteSessionPeek(id)
-    expect(store.sessionPeek(id)).toBeUndefined()
+    store.deleteSessionRequest(id)
+    expect(store.sessionRequest(id)).toBeUndefined()
   })
 
-  test("session peeks record an error and prune by age", async () => {
+  test("session requests record an error and prune by age", async () => {
     const store = new JobStore(":memory:")
-    const id = store.requestSessionPeek("/proj", "ses_1")
-    store.answerSessionPeek(id, { error: "boom" })
-    expect(store.sessionPeek(id)).toMatchObject({ status: "error", error: "boom" })
+    const id = store.createSessionRequest("/proj", "status", "ses_1")
+    store.failSessionRequest(id, "boom")
+    expect(store.sessionRequest(id)).toMatchObject({ status: "error", error: "boom" })
 
-    expect(store.pruneSessionPeeks(60_000)).toBe(0)
+    expect(store.pruneSessionRequests(60_000)).toBe(0)
     await Bun.sleep(5)
-    expect(store.pruneSessionPeeks(0)).toBe(1)
-    expect(store.sessionPeek(id)).toBeUndefined()
+    expect(store.pruneSessionRequests(0)).toBe(1)
+    expect(store.sessionRequest(id)).toBeUndefined()
   })
 
   test("defaultDatabasePath honours OPENCODE_BGJ_DB", () => {

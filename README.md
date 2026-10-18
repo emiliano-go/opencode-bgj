@@ -39,18 +39,27 @@ with `bgj_`.
 |---|---|---|
 | `start` | `{ command, cwd?, env?, shell?, timeout_ms?, notify? }` | job info |
 | `run_detached` | `{ command, cwd?, env?, shell? }` | job info, `detached: true`, `log` |
-| `list` | `{ active_only? }` | `{ jobs: [...] }` |
-| `status` | `{ job_id }` | job info |
+| `list` | `{ active_only? }` | `{ jobs: [...] }` (shell, detached, and session entries) |
+| `status` | `{ job_id?, session_id? }` | job info, or session status |
 | `output` | `{ job_id?, session_id?, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
-| `stop` | `{ job_id, signal? }` | job info |
-| `wait` | `{ job_id, timeout_s? }` | `{ job, timed_out }` |
+| `stop` | `{ job_id?, session_id?, signal? }` | job info, or `{ session_id, session, aborted }` |
+| `wait` | `{ job_id?, session_id?, timeout_s? }` | `{ job, timed_out }` or `{ session_id, ..., timed_out }` |
 
-`output` reads the current output of a job. Pass `job_id` for a shell job (the
-merged stdout and stderr buffer, sliced by `tail_bytes` or `offset`), or
-`session_id` to read what a running opencode session has produced so far, for
-example a background subagent. A session read returns the latest assistant
-message text, whether the session is still running, and its message count. Pass
-exactly one of the two ids.
+`session_id` names an opencode session, for example the task id the `task` tool
+reports for a background subagent. `output` with a `session_id` returns the
+latest assistant message text, whether the session is still running, and its
+message count; `status` reports just the running flag and message count; `wait`
+polls until the session goes idle; `stop` aborts it (which cancels its turn).
+`list` includes the directory's child sessions (background subagents) alongside
+shell and detached jobs. Each tool takes exactly one of `job_id` or
+`session_id`. Sessions need the `bgj-notify` plugin: the MCP server runs in a
+separate process and cannot read or control a session itself, so it files the
+request in the shared database and the plugin, which runs inside opencode,
+answers it. Without the plugin a `session_id` call returns an error telling you
+to install it.
+
+`output` with a `job_id` reads a shell job's merged stdout and stderr buffer,
+sliced by `tail_bytes` or `offset`.
 
 `run_detached` starts a command fully detached in its own session so it keeps
 running after opencode exits, and it never sends a completion notification:
@@ -233,12 +242,15 @@ environment only; there is no `opencode.json` key). The `task` tool then accepts
 `background: true`: it returns immediately and injects the subagent's result as
 a message when it finishes.
 
-To check on a background subagent before it finishes, call `output` with its
-session id, the task id the `task` tool reported. The MCP server runs in a
-separate process and cannot read a session itself, so it files a request in the
-central database and the plugin, which runs inside opencode, reads the session
-and writes the answer back; `output` waits briefly for it. Without the plugin,
-`output` with a `session_id` returns an error telling you to install it.
+To check on a background subagent before it finishes, call `output`, `status`,
+`wait`, or `stop` with its session id, the task id the `task` tool reported.
+`output` returns what it has produced so far, `status` polls it, `wait` blocks
+until it goes idle, and `stop` aborts it. `list` shows the directory's child
+sessions (background subagents) alongside shell jobs. The MCP server runs in a
+separate process and cannot read or control a session itself, so it files a
+request in the central database and the plugin, which runs inside opencode,
+answers it; the tool waits briefly for the answer. Without the plugin, any
+`session_id` call returns an error telling you to install it.
 
 ## Why not opencode's built-in BackgroundJob?
 

@@ -77,9 +77,10 @@ describe("runtime tools", () => {
     store.setInstance("/proj", "http://localhost:4096/")
     const answered = (async () => {
       for (let i = 0; i < 400; i++) {
-        const [pending] = store.pendingSessionPeeks("/proj")
+        const [pending] = store.pendingSessionRequests("/proj")
         if (pending) {
-          store.answerSessionPeek(pending.id, { text: "working", running: true, messages: 4 })
+          expect(pending.op).toBe("peek")
+          store.answerSessionRequest(pending.id, { text: "working", running: true, messages: 4 })
           return
         }
         await Bun.sleep(10)
@@ -91,7 +92,7 @@ describe("runtime tools", () => {
     expect(structured(result).text).toBe("working")
     expect(structured(result).running).toBe(true)
     expect(structured(result).messages).toBe(4)
-    expect(store.pendingSessionPeeks("/proj")).toHaveLength(0)
+    expect(store.pendingSessionRequests("/proj")).toHaveLength(0)
   })
 
   test("output applies tail_bytes to a session answer", async () => {
@@ -99,9 +100,9 @@ describe("runtime tools", () => {
     store.setInstance("/proj", "http://localhost:4096/")
     const answered = (async () => {
       for (let i = 0; i < 400; i++) {
-        const [pending] = store.pendingSessionPeeks("/proj")
+        const [pending] = store.pendingSessionRequests("/proj")
         if (pending) {
-          store.answerSessionPeek(pending.id, { text: "abcdef", running: false, messages: 1 })
+          store.answerSessionRequest(pending.id, { text: "abcdef", running: false, messages: 1 })
           return
         }
         await Bun.sleep(10)
@@ -118,9 +119,9 @@ describe("runtime tools", () => {
     store.setInstance("/proj", "http://localhost:4096/")
     const answered = (async () => {
       for (let i = 0; i < 400; i++) {
-        const [pending] = store.pendingSessionPeeks("/proj")
+        const [pending] = store.pendingSessionRequests("/proj")
         if (pending) {
-          store.answerSessionPeek(pending.id, { error: "boom" })
+          store.failSessionRequest(pending.id, "boom")
           return
         }
         await Bun.sleep(10)
@@ -132,10 +133,91 @@ describe("runtime tools", () => {
     expect((result.content as { text: string }[])[0]!.text).toContain("boom")
   })
 
+  test("status reports a session through the shared database", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionRequests("/proj")
+        if (pending) {
+          expect(pending.op).toBe("status")
+          store.answerSessionRequest(pending.id, { running: false, messages: 7 })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "status", { session_id: "ses_1" }, "/proj")
+    await answered
+    expect(structured(result)).toMatchObject({ session_id: "ses_1", session: true, status: "completed", running: false, messages: 7 })
+  })
+
+  test("wait returns once a session goes idle", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionRequests("/proj")
+        if (pending) {
+          expect(pending.op).toBe("status")
+          store.answerSessionRequest(pending.id, { running: false, messages: 2 })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "wait", { session_id: "ses_1" }, "/proj")
+    await answered
+    expect(structured(result)).toMatchObject({ session_id: "ses_1", session: true, running: false, timed_out: false })
+  })
+
+  test("stop aborts a session through the shared database", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionRequests("/proj")
+        if (pending) {
+          expect(pending.op).toBe("abort")
+          expect(pending.session_id).toBe("ses_1")
+          store.answerSessionRequest(pending.id, { aborted: true })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "stop", { session_id: "ses_1" }, "/proj")
+    await answered
+    expect(structured(result)).toMatchObject({ session_id: "ses_1", session: true, aborted: true })
+  })
+
+  test("list includes sessions answered through the shared database", async () => {
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    const answered = (async () => {
+      for (let i = 0; i < 400; i++) {
+        const [pending] = store.pendingSessionRequests("/proj")
+        if (pending) {
+          expect(pending.op).toBe("list")
+          store.answerSessionRequest(pending.id, {
+            sessions: [{ session_id: "ses_child", parent_id: "ses_parent", title: "probe", running: true }],
+          })
+          return
+        }
+        await Bun.sleep(10)
+      }
+    })()
+    const result = await dispatch(new JobManager(), store, undefined, "list", {}, "/proj")
+    await answered
+    const jobs = structured(result).jobs as { session_id?: string; session?: boolean }[]
+    expect(jobs).toContainEqual(expect.objectContaining({ session_id: "ses_child", session: true }))
+  })
+
   test("output errors for an unregistered session directory or no id", async () => {
     const { run } = harness()
     expect(await run("output", { session_id: "ses_1" })).toMatchObject({ isError: true })
     expect(await run("output", {})).toMatchObject({ isError: true })
+    expect(await run("status", { session_id: "ses_1" })).toMatchObject({ isError: true })
     expect(await dispatch(new JobManager(), undefined, undefined, "output", { session_id: "ses_1" })).toMatchObject({ isError: true })
   })
 })

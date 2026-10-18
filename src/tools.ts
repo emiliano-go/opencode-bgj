@@ -1,10 +1,35 @@
 import { DetachedManager } from "./detached"
 import type { JobInfo } from "./jobs"
 import { JobManager } from "./jobs"
-import type { JobDefinition, JobDefinitionPatch, JobStore } from "./store"
+import type { JobDefinition, JobDefinitionPatch, JobStore, SessionOp } from "./store"
 
-const SESSION_PEEK_TIMEOUT_MS = 5000
-const SESSION_PEEK_POLL_MS = 50
+const SESSION_REQUEST_TIMEOUT_MS = 5000
+const SESSION_WAIT_REQUEST_TIMEOUT_MS = 10000
+const SESSION_WAIT_POLL_MS = 1000
+const SESSION_REQUEST_POLL_MS = 50
+
+interface PeekResult {
+  text: string
+  running: boolean
+  messages: number
+}
+
+interface StatusResult {
+  running: boolean
+  messages: number
+}
+
+interface AbortResult {
+  aborted: boolean
+}
+
+interface SessionSummary {
+  session_id: string
+  parent_id?: string
+  title?: string
+  running: boolean
+  created?: number
+}
 
 export const TOOLS = [
   {
@@ -47,9 +72,10 @@ Arguments:
   },
   {
     name: "list",
-    description: `List the background jobs tracked by this server in the current session, oldest first (by start time).
-Jobs are held in memory only and are lost when the MCP server exits; finished jobs stay listed until then. Use the returned id with status, output, wait, and stop.
-Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, and error (when the command could not be spawned).`,
+    description: `List the background jobs and opencode sessions tracked by this server for the current directory, oldest first (by start time).
+Shell jobs are held in memory only and are lost when the MCP server exits; finished jobs stay listed until then. Sessions come from the bgj-notify plugin: the directory's child sessions (background subagents), so a background subagent shows up here. Detached jobs (run_detached) are included too.
+Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, and error (when the command could not be spawned). Session entries carry session_id, parent_id, title, status ("running" or "completed"), session (true), and running instead. Use the returned id with status, output, wait, and stop.
+Set active_only to true to show only entries that are still running.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -59,14 +85,16 @@ Returns an array of jobs, each with job_id, command, cwd, pid, status ("running"
   },
   {
     name: "status",
-    description: `Get the current state of one background job by id. Use it to poll a running job without blocking, or to check how a finished job ended.
-Returns the same fields as list for that job: job_id, command, cwd, pid, status, exit_code, started_at and ended_at (milliseconds since the Unix epoch), and error when the command could not be spawned. Returns an error result if no job with that id is tracked (for example after the server has restarted).`,
+    description: `Get the current state of one background job or session. Pass job_id for a shell or detached job, or session_id for an opencode session (for example a background subagent): a session is "running" while busy and "completed" once idle.
+Use it to poll a running job without blocking, or to check how a finished job ended. Pass exactly one of job_id or session_id.
+For a job, returns job_id, command, cwd, pid, status, exit_code, started_at and ended_at (milliseconds since the Unix epoch), and error when the command could not be spawned. For a session, returns session_id, session (true), status, running, and messages.
+Returns an error result if no job or session with that id is tracked, or if the plugin is not running.`,
     inputSchema: {
       type: "object",
       properties: {
-        job_id: { type: "string", description: "Background job id returned by start or run_job (for example bgj-1a2b3c4d)." },
+        job_id: { type: "string", description: "Background job id returned by start, run_job, or run_detached (for example bgj-1a2b3c4d)." },
+        session_id: { type: "string", description: "Session id to check, for example a background subagent's task id." },
       },
-      required: ["job_id"],
     },
   },
   {
@@ -87,30 +115,32 @@ Returns the id, text, size_bytes (total produced so far, even if some was droppe
   },
   {
     name: "stop",
-    description: `Stop a background job that is still running. Sends the given signal (SIGTERM by default) to the job's process group, waits up to 5 seconds, and escalates to SIGKILL if it is still alive. The job's status becomes "killed".
-Calling stop on a job that has already finished is a no-op and returns its final state. Returns the job's fields as in status.`,
+    description: `Stop a running background job or abort an opencode session.
+For a job (job_id), sends the given signal (SIGTERM by default) to the job's process group, waits up to 5 seconds, and escalates to SIGKILL if it is still alive. The job's status becomes "killed". For a detached job this also stops work started with run_detached.
+For a session (session_id), aborts the session, which cancels the turn it is running (for example a background subagent). Pass exactly one of job_id or session_id.
+Calling stop on a job that has already finished is a no-op and returns its final state. Returns the job's fields as in status, or { session_id, session, aborted } for a session.`,
     inputSchema: {
       type: "object",
       properties: {
-        job_id: { type: "string", description: "Background job id returned by start or run_job." },
+        job_id: { type: "string", description: "Background job id returned by start, run_job, or run_detached." },
+        session_id: { type: "string", description: "Session id to abort, for example a background subagent's task id." },
         signal: { type: "string", description: "Initial signal sent to the job's process group (default SIGTERM). SIGKILL is sent automatically if the job does not exit within 5 seconds." },
       },
-      required: ["job_id"],
     },
   },
   {
     name: "wait",
-    description: `Block until a background job finishes, or until the timeout elapses, then return its final state.
+    description: `Block until a background job or session finishes, or until the timeout elapses, then return its final state. Pass job_id for a shell job, or session_id to wait until an opencode session goes idle (for example a background subagent's turn completes). Pass exactly one of job_id or session_id.
 Use wait ONLY when you have nothing else to do in the meantime but wait for this job; it suspends the turn until the job ends or timeout_s elapses. If you could be doing other work while the job runs, do NOT call wait: start the job with notify left at its default and continue, and the completion message will wake you when it is done. Never call wait merely to poll for progress.
 Passing timeout_s: 0 returns immediately with the current state. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
 Returns the finished job (or its latest state if the timeout elapsed) and timed_out, which is true when the timeout was reached before the job finished. Errors if the job id is not tracked.`,
     inputSchema: {
       type: "object",
       properties: {
-        job_id: { type: "string", description: "Background job id returned by start or run_job." },
+        job_id: { type: "string", description: "Background job id returned by start, run_job, or run_detached." },
+        session_id: { type: "string", description: "Session id to wait for, for example a background subagent's task id." },
         timeout_s: { type: "number", minimum: 0, description: "Maximum seconds to wait. Omit to wait with no limit until the job finishes; 0 returns immediately." },
       },
-      required: ["job_id"],
     },
   },
   {
@@ -240,16 +270,20 @@ export async function dispatch(
         const activeOnly = args.active_only === true
         const entries: object[] = jobs.list(activeOnly).map(toWire)
         if (detached) entries.push(...detached.list(directory).filter((job) => !activeOnly || job.status === "running"))
+        entries.push(...(await sessionList(store, directory, activeOnly)).map(sessionToWire))
         entries.sort((a, b) => (a as { started_at: number }).started_at - (b as { started_at: number }).started_at)
         return ok({ jobs: entries })
       }
-      case "status":
+      case "status": {
+        const sessionID = optionalStr(args.session_id)
+        if (sessionID !== undefined) return await sessionStatus(store, directory, sessionID)
         return withId(args.job_id, (id) => {
           const info = jobs.status(id)
           if (info) return ok(toWire(info))
           const job = detached?.status(id)
           return job ? ok(job) : unknownJob(id)
         })
+      }
       case "output": {
         const sessionID = optionalStr(args.session_id)
         if (sessionID !== undefined) return await sessionOutput(store, directory, sessionID, args)
@@ -261,20 +295,26 @@ export async function dispatch(
           return job ? ok({ job_id: id, ...job }) : unknownJob(id)
         })
       }
-      case "stop":
+      case "stop": {
+        const sessionID = optionalStr(args.session_id)
+        if (sessionID !== undefined) return await sessionStop(store, directory, sessionID)
         return await withIdAsync(args.job_id, async (id) => {
           const info = await jobs.stop(id, optionalStr(args.signal))
           if (info) return ok(toWire(info))
           const job = await detached?.stop(id, optionalStr(args.signal))
           return job ? ok(job) : unknownJob(id)
         })
-      case "wait":
+      }
+      case "wait": {
+        const sessionID = optionalStr(args.session_id)
+        if (sessionID !== undefined) return await sessionWait(store, directory, sessionID, optionalNumber(args.timeout_s))
         return await withIdAsync(args.job_id, async (id) => {
           if (!jobs.status(id)) return unknownJob(id)
           const timeout_s = optionalNumber(args.timeout_s)
           const result = await jobs.wait(id, timeout_s === undefined ? undefined : timeout_s * 1000)
           return ok({ job: toWire(result.job), timed_out: result.timed_out })
         })
+      }
       case "create_job":
         return ok(toWireDefinition(store!.create(readDefinition(args))))
       case "list_jobs":
@@ -404,28 +444,52 @@ function unknownJob(id: string): ToolResult {
   return fail(`unknown job: ${id}`)
 }
 
+// Files one request for the plugin and waits for its answer. Every session tool
+// goes through here; op selects the action and sessionID is omitted for list.
+async function sessionRequest<T>(
+  store: JobStore,
+  directory: string,
+  op: SessionOp,
+  sessionID: string | undefined,
+  timeoutMs = SESSION_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const id = store.createSessionRequest(directory, op, sessionID)
+  try {
+    const deadline = Date.now() + timeoutMs
+    let request = store.sessionRequest(id)
+    while ((!request || request.status === "pending") && Date.now() < deadline) {
+      await delay(SESSION_REQUEST_POLL_MS)
+      request = store.sessionRequest(id)
+    }
+    if (!request || request.status === "pending") {
+      const target = sessionID ? ` for session ${sessionID}` : ""
+      throw new Error(`timed out waiting for the plugin to answer ${op}${target}; is the bgj-notify plugin running?`)
+    }
+    if (request.status === "error") throw new Error(request.error ?? `the plugin could not answer ${op}`)
+    return request.result as T
+  } finally {
+    store.deleteSessionRequest(id)
+  }
+}
+
+function sessionReady(store: JobStore | undefined, directory: string): ToolResult | undefined {
+  if (!store) return fail("job store unavailable")
+  if (!store.hasInstance(directory)) {
+    return fail(`no opencode instance registered for ${directory}; install and restart the bgj-notify plugin`)
+  }
+  return undefined
+}
+
 async function sessionOutput(
   store: JobStore | undefined,
   directory: string,
   sessionID: string,
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
-  if (!store) return fail("job store unavailable")
-  if (!store.hasInstance(directory)) {
-    return fail(`no opencode instance registered for ${directory}; install and restart the bgj-notify plugin`)
-  }
-  const id = store.requestSessionPeek(directory, sessionID)
+  const notReady = sessionReady(store, directory)
+  if (notReady) return notReady
   try {
-    const deadline = Date.now() + SESSION_PEEK_TIMEOUT_MS
-    let peek = store.sessionPeek(id)
-    while ((!peek || peek.status === "pending") && Date.now() < deadline) {
-      await delay(SESSION_PEEK_POLL_MS)
-      peek = store.sessionPeek(id)
-    }
-    if (!peek || peek.status === "pending") {
-      return fail(`timed out waiting for the plugin to read session ${sessionID}; is the bgj-notify plugin running?`)
-    }
-    if (peek.status === "error") return fail(peek.error ?? `could not read session ${sessionID}`)
+    const peek = await sessionRequest<PeekResult>(store!, directory, "peek", sessionID)
     const bytes = Buffer.from(peek.text ?? "")
     const offset = optionalInt(args.offset)
     const tailBytes = optionalInt(args.tail_bytes)
@@ -439,9 +503,90 @@ async function sessionOutput(
       running: peek.running ?? false,
       messages: peek.messages ?? 0,
     })
-  } finally {
-    store.deleteSessionPeek(id)
+  } catch (error) {
+    return fail(errorMessage(error))
   }
+}
+
+async function sessionStatus(store: JobStore | undefined, directory: string, sessionID: string): Promise<ToolResult> {
+  const notReady = sessionReady(store, directory)
+  if (notReady) return notReady
+  try {
+    const status = await sessionRequest<StatusResult>(store!, directory, "status", sessionID)
+    return ok(sessionWire(sessionID, status))
+  } catch (error) {
+    return fail(errorMessage(error))
+  }
+}
+
+async function sessionWait(
+  store: JobStore | undefined,
+  directory: string,
+  sessionID: string,
+  timeoutSeconds: number | undefined,
+): Promise<ToolResult> {
+  const notReady = sessionReady(store, directory)
+  if (notReady) return notReady
+  const deadline = timeoutSeconds === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutSeconds * 1000
+  try {
+    while (true) {
+      const status = await sessionRequest<StatusResult>(store!, directory, "status", sessionID, SESSION_WAIT_REQUEST_TIMEOUT_MS)
+      if (!status.running) return ok({ ...sessionWire(sessionID, status), timed_out: false })
+      if (Date.now() >= deadline) return ok({ ...sessionWire(sessionID, status), timed_out: true })
+      await delay(SESSION_WAIT_POLL_MS)
+    }
+  } catch (error) {
+    return fail(errorMessage(error))
+  }
+}
+
+async function sessionStop(store: JobStore | undefined, directory: string, sessionID: string): Promise<ToolResult> {
+  const notReady = sessionReady(store, directory)
+  if (notReady) return notReady
+  try {
+    const result = await sessionRequest<AbortResult>(store!, directory, "abort", sessionID)
+    return ok({ session_id: sessionID, session: true, aborted: result.aborted ?? true })
+  } catch (error) {
+    return fail(errorMessage(error))
+  }
+}
+
+async function sessionList(
+  store: JobStore | undefined,
+  directory: string,
+  activeOnly: boolean,
+): Promise<SessionSummary[]> {
+  if (!store || !store.hasInstance(directory)) return []
+  try {
+    const result = await sessionRequest<{ sessions: SessionSummary[] }>(store, directory, "list", undefined)
+    const sessions = result.sessions ?? []
+    return activeOnly ? sessions.filter((session) => session.running) : sessions
+  } catch {
+    // the plugin may be gone; fall back to shell and detached jobs only
+    return []
+  }
+}
+
+function sessionWire(sessionID: string, status: StatusResult) {
+  return {
+    session_id: sessionID,
+    session: true,
+    status: status.running ? "running" : "completed",
+    running: status.running,
+    messages: status.messages,
+  }
+}
+
+function sessionToWire(summary: SessionSummary) {
+  return compact({
+    session_id: summary.session_id,
+    parent_id: summary.parent_id,
+    title: summary.title,
+    session: true,
+    status: summary.running ? "running" : "completed",
+    running: summary.running,
+    started_at: summary.created,
+  })
 }
 
 function delay(ms: number): Promise<void> {

@@ -29,7 +29,7 @@ let store: JobStore | undefined
 try {
   store = new JobStore()
   store.pruneRuns(24 * 60 * 60 * 1000)
-  store.pruneSessionPeeks(24 * 60 * 60 * 1000)
+  store.pruneSessionRequests(24 * 60 * 60 * 1000)
   store.pruneDetached(24 * 60 * 60 * 1000)
 } catch (error) {
   log(`persistent job store unavailable: ${reason(error)}`)

@@ -68,6 +68,14 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
       messages: async (_options: { path: { id: string } }) => ({
         data: [{ info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "peeked" }] }],
       }),
+      list: async () => ({
+        data: [
+          { id: "ses_parent", title: "parent" },
+          { id: "ses_child", parentID: "ses_parent", title: "probe" },
+        ],
+      }),
+      status: async () => ({ data: { ses_parent: { type: "idle" }, ses_child: { type: "busy" } } }),
+      abort: async () => ({ data: true }),
     },
     tui: {
       showToast: async (options: { body: { message: string } }) => {
@@ -99,11 +107,20 @@ test("plugin delivers only its directory's finished jobs and clears their rows",
   expect(check.pendingRuns("/proj/other").map((run) => run.id)).toEqual(["bgj-other"])
   expect(check.instanceURL("/proj/test")).toBe("http://127.0.0.1:1234/")
 
-  const peekID = check.requestSessionPeek("/proj/test", "ses_peek")
-  for (let i = 0; i < 200 && check.sessionPeek(peekID)?.status === "pending"; i++) await Bun.sleep(20)
-  const peek = check.sessionPeek(peekID)
+  const peekID = check.createSessionRequest("/proj/test", "peek", "ses_peek")
+  for (let i = 0; i < 200 && check.sessionRequest(peekID)?.status === "pending"; i++) await Bun.sleep(20)
+  const peek = check.sessionRequest(peekID)
   expect(peek?.status).toBe("done")
-  expect(peek?.text).toBe("peeked")
-  expect(peek?.messages).toBe(1)
+  expect(peek?.result).toMatchObject({ text: "peeked", running: true, messages: 1 })
+
+  const listID = check.createSessionRequest("/proj/test", "list")
+  for (let i = 0; i < 200 && check.sessionRequest(listID)?.status === "pending"; i++) await Bun.sleep(20)
+  expect(check.sessionRequest(listID)?.result).toMatchObject({
+    sessions: [{ session_id: "ses_child", parent_id: "ses_parent", title: "probe", running: true }],
+  })
+
+  const abortID = check.createSessionRequest("/proj/test", "abort", "ses_child")
+  for (let i = 0; i < 200 && check.sessionRequest(abortID)?.status === "pending"; i++) await Bun.sleep(20)
+  expect(check.sessionRequest(abortID)?.result).toEqual({ aborted: true })
   check.close()
 })

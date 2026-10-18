@@ -50,14 +50,17 @@ export interface JobRun extends JobRunInput {
   notified: boolean
 }
 
-export interface SessionPeek {
+export type SessionOp = "peek" | "status" | "list" | "abort"
+
+// A request the MCP server files for the plugin to answer from inside opencode,
+// because the server is a separate process and cannot touch a session itself.
+export interface SessionRequest {
   id: string
   directory: string
-  session_id: string
+  session_id?: string
+  op: SessionOp
   status: "pending" | "done" | "error"
-  text?: string
-  running?: boolean
-  messages?: number
+  result?: unknown
   error?: string
   created_at: number
   answered_at?: number
@@ -125,14 +128,13 @@ interface Row {
   updated_at: number
 }
 
-interface PeekRow {
+interface SessionRequestRow {
   id: string
   directory: string
-  session_id: string
+  session_id: string | null
+  op: string
   status: string
-  text: string | null
-  running: number | null
-  messages: number | null
+  result: string | null
   error: string | null
   created_at: number
   answered_at: number | null
@@ -212,24 +214,26 @@ export class JobStore {
         updated_at INTEGER NOT NULL
       )
     `)
-    // output(session_id) cannot read a session in-process (the MCP server is a
-    // separate process), so it files a request here and the plugin, which shares
-    // the opencode process, answers it on its next poll.
+    // The MCP server cannot touch a session in-process (it is a separate
+    // process), so it files a request here and the plugin, which shares the
+    // opencode process, answers it on its next poll. op selects the action
+    // (peek, status, list, abort) and result holds the JSON answer.
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS session_peeks (
+      CREATE TABLE IF NOT EXISTS session_requests (
         id TEXT PRIMARY KEY,
         directory TEXT NOT NULL,
-        session_id TEXT NOT NULL,
+        session_id TEXT,
+        op TEXT NOT NULL,
         status TEXT NOT NULL,
-        text TEXT,
-        running INTEGER,
-        messages INTEGER,
+        result TEXT,
         error TEXT,
         created_at INTEGER NOT NULL,
         answered_at INTEGER
       )
     `)
-    this.db.exec("CREATE INDEX IF NOT EXISTS session_peeks_pending ON session_peeks (status, directory, created_at)")
+    this.db.exec("CREATE INDEX IF NOT EXISTS session_requests_pending ON session_requests (status, directory, created_at)")
+    // Superseded by session_requests; drop the old transient table.
+    this.db.exec("DROP TABLE IF EXISTS session_peeks")
     // run_detached jobs: spawned in their own session so they outlive this
     // process, with output on disk. Kept out of job_runs so they never enter
     // the plugin's notify queue; that is what makes a detached job silent.
@@ -374,44 +378,47 @@ export class JobStore {
     return this.db.query("SELECT 1 FROM instances WHERE directory = ? LIMIT 1").get(directory) !== null
   }
 
-  requestSessionPeek(directory: string, sessionID: string): string {
-    const id = `peek-${randomSuffix()}`
+  createSessionRequest(directory: string, op: SessionOp, sessionID?: string): string {
+    const id = `req-${randomSuffix()}`
     this.db
-      .query("INSERT INTO session_peeks (id, directory, session_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)")
-      .run(id, directory, sessionID, Date.now())
+      .query("INSERT INTO session_requests (id, directory, session_id, op, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)")
+      .run(id, directory, sessionID ?? null, op, Date.now())
     return id
   }
 
-  sessionPeek(id: string): SessionPeek | undefined {
-    const row = this.db.query("SELECT * FROM session_peeks WHERE id = ?").get(id) as PeekRow | null
-    return row ? toPeek(row) : undefined
+  sessionRequest(id: string): SessionRequest | undefined {
+    const row = this.db.query("SELECT * FROM session_requests WHERE id = ?").get(id) as SessionRequestRow | null
+    return row ? toSessionRequest(row) : undefined
   }
 
-  // Called by tests and the plugin's raw SQL counterpart; the server only reads.
-  answerSessionPeek(id: string, result: { text: string; running: boolean; messages: number } | { error: string }): void {
-    if ("error" in result) {
-      this.db
-        .query("UPDATE session_peeks SET status = 'error', error = ?, answered_at = ? WHERE id = ?")
-        .run(result.error, Date.now(), id)
-      return
-    }
+  // Called by tests; the plugin writes the same columns through raw SQL, and
+  // the server only reads.
+  answerSessionRequest(id: string, result: unknown): void {
     this.db
-      .query("UPDATE session_peeks SET status = 'done', text = ?, running = ?, messages = ?, answered_at = ? WHERE id = ?")
-      .run(result.text, result.running ? 1 : 0, result.messages, Date.now(), id)
+      .query("UPDATE session_requests SET status = 'done', result = ?, answered_at = ? WHERE id = ?")
+      .run(JSON.stringify(result), Date.now(), id)
   }
 
-  deleteSessionPeek(id: string): void {
-    this.db.query("DELETE FROM session_peeks WHERE id = ?").run(id)
+  failSessionRequest(id: string, error: string): void {
+    this.db
+      .query("UPDATE session_requests SET status = 'error', error = ?, answered_at = ? WHERE id = ?")
+      .run(error, Date.now(), id)
   }
 
-  pendingSessionPeeks(directory: string, limit = 10): { id: string; session_id: string }[] {
+  deleteSessionRequest(id: string): void {
+    this.db.query("DELETE FROM session_requests WHERE id = ?").run(id)
+  }
+
+  // The plugin reads these rows with its own SQL (it runs inside opencode, a
+  // separate runtime); this is the store-side view used by tests.
+  pendingSessionRequests(directory: string, limit = 10): { id: string; session_id: string | null; op: SessionOp }[] {
     return this.db
-      .query("SELECT id, session_id FROM session_peeks WHERE status = 'pending' AND directory = ? ORDER BY created_at LIMIT ?")
-      .all(directory, limit) as { id: string; session_id: string }[]
+      .query("SELECT id, session_id, op FROM session_requests WHERE status = 'pending' AND directory = ? ORDER BY created_at LIMIT ?")
+      .all(directory, limit) as { id: string; session_id: string | null; op: SessionOp }[]
   }
 
-  pruneSessionPeeks(olderThanMs: number): number {
-    return this.db.query("DELETE FROM session_peeks WHERE created_at < ?").run(Date.now() - olderThanMs).changes
+  pruneSessionRequests(olderThanMs: number): number {
+    return this.db.query("DELETE FROM session_requests WHERE created_at < ?").run(Date.now() - olderThanMs).changes
   }
 
   runsDir(): string {
@@ -550,15 +557,14 @@ function toDetached(row: DetachedRow): DetachedRun {
   }
 }
 
-function toPeek(row: PeekRow): SessionPeek {
+function toSessionRequest(row: SessionRequestRow): SessionRequest {
   return {
     id: row.id,
     directory: row.directory,
-    session_id: row.session_id,
-    status: row.status as SessionPeek["status"],
-    text: row.text ?? undefined,
-    running: row.running === null ? undefined : row.running === 1,
-    messages: row.messages ?? undefined,
+    session_id: row.session_id ?? undefined,
+    op: row.op as SessionOp,
+    status: row.status as SessionRequest["status"],
+    result: parseJson<unknown>(row.result),
     error: row.error ?? undefined,
     created_at: row.created_at,
     answered_at: row.answered_at ?? undefined,
