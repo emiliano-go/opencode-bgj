@@ -43,7 +43,7 @@ with `bgj_`.
 | `status` | `{ job_id?, session_id? }` | job info, or session status |
 | `output` | `{ job_id?, session_id?, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
 | `stop` | `{ job_id?, session_id?, signal? }` | job info, or `{ session_id, session, aborted }` |
-| `wait` | `{ job_id?, session_id?, timeout_s? }` | `{ job, timed_out }` or `{ session_id, ..., timed_out }` |
+| `wait` | `{ job_id?, session_id?, timeout_s? }` | `{ job, timed_out, waited_ms }` or `{ session_id, ..., timed_out, waited_ms }` |
 
 `session_id` names an opencode session, for example the task id the `task` tool
 reports for a background subagent. `output` with a `session_id` returns the
@@ -158,8 +158,12 @@ Caveats:
   the cap is reached the oldest bytes are dropped, so `output` always returns the
   most recent data. `output` reads from a byte `offset` or from the last
   `tail_bytes`, and reports `size_bytes` and whether the result was `truncated`.
-- `wait` blocks until the job reaches a terminal status or `timeout_s` elapses,
-  returning `timed_out` to signal the latter.
+- `wait` blocks until the job reaches a terminal status or the timeout elapses,
+  returning `timed_out` to signal the latter and `waited_ms` for the time actually
+  blocked. The block is capped at 45 s (`OPENCODE_BGJ_MAX_WAIT_MS`), safely below
+  the client's 60 s `mcp_timeout`, so the call always resolves before the client
+  cancels it with `-32001: Request timed out`. When `timed_out` is true the job is
+  still running, so call `wait` again to keep waiting.
 - Runtime jobs are in-memory only. They live as long as the opencode session and
   stop with the MCP server. Detached jobs are the exception: they keep running
   after the server exits and their output and status persist on disk. Job

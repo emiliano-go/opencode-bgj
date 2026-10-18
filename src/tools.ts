@@ -8,6 +8,24 @@ const SESSION_WAIT_REQUEST_TIMEOUT_MS = 10000
 const SESSION_WAIT_POLL_MS = 1000
 const SESSION_REQUEST_POLL_MS = 50
 
+// The opencode client abandons any MCP call after `mcp_timeout` (60 s by
+// default) with `-32001: Request timed out`, so a longer block is cancelled
+// before the handler can return. Cap every wait safely below that; a
+// `timed_out: true` result means "still running, call wait again", not "gone".
+// ponytail: fixed 45 s cap; raise OPENCODE_BGJ_MAX_WAIT_MS if mcp_timeout grows.
+const DEFAULT_MAX_WAIT_MS = 45_000
+
+function maxWaitMs(): number {
+  const raw = Number(process.env.OPENCODE_BGJ_MAX_WAIT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_WAIT_MS
+}
+
+function effectiveWaitMs(timeoutSeconds: number | undefined): number {
+  const cap = maxWaitMs()
+  if (timeoutSeconds === undefined) return cap
+  return Math.min(Math.max(0, timeoutSeconds) * 1000, cap)
+}
+
 interface PeekResult {
   text: string
   running: boolean
@@ -132,14 +150,14 @@ Calling stop on a job that has already finished is a no-op and returns its final
     name: "wait",
     description: `Block until a background job or session finishes, or until the timeout elapses, then return its final state. Pass job_id for a shell job, or session_id to wait until an opencode session goes idle (for example a background subagent's turn completes). Pass exactly one of job_id or session_id.
 Use wait ONLY when you have nothing else to do in the meantime but wait for this job; it suspends the turn until the job ends or timeout_s elapses. If you could be doing other work while the job runs, do NOT call wait: start the job with notify left at its default and continue, and the completion message will wake you when it is done. Never call wait merely to poll for progress.
-Passing timeout_s: 0 returns immediately with the current state. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
-Returns the finished job (or its latest state if the timeout elapsed) and timed_out, which is true when the timeout was reached before the job finished. Errors if the job id is not tracked.`,
+The wait is capped at the server limit (about 45 s) so it always returns before the client's request timeout. A result with timed_out: true means the job is still running: call wait again to keep waiting. Passing timeout_s: 0 returns immediately with the current state. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
+Returns the finished job (or its latest state if the timeout elapsed), timed_out, which is true when the timeout was reached before the job finished, and waited_ms, the time actually blocked. Errors if the job id is not tracked.`,
     inputSchema: {
       type: "object",
       properties: {
         job_id: { type: "string", description: "Background job id returned by start, run_job, or run_detached." },
         session_id: { type: "string", description: "Session id to wait for, for example a background subagent's task id." },
-        timeout_s: { type: "number", minimum: 0, description: "Maximum seconds to wait. Omit to wait with no limit until the job finishes; 0 returns immediately." },
+        timeout_s: { type: "number", minimum: 0, description: "Maximum seconds to wait, capped at the server limit (about 45 s, see OPENCODE_BGJ_MAX_WAIT_MS). Omit to use the full cap; 0 returns immediately. A timed_out: true result means still running, so call wait again." },
       },
     },
   },
@@ -317,9 +335,9 @@ export async function dispatch(
         if (sessionID !== undefined) return await sessionWait(store, directory, sessionID, optionalNumber(args.timeout_s))
         return await withIdAsync(args.job_id, async (id) => {
           if (!jobs.status(id)) return unknownJob(id)
-          const timeout_s = optionalNumber(args.timeout_s)
-          const result = await jobs.wait(id, timeout_s === undefined ? undefined : timeout_s * 1000)
-          return ok({ job: toWire(result.job), timed_out: result.timed_out })
+          const started = Date.now()
+          const result = await jobs.wait(id, effectiveWaitMs(optionalNumber(args.timeout_s)))
+          return ok({ job: toWire(result.job), timed_out: result.timed_out, waited_ms: Date.now() - started })
         })
       }
       case "create_job":
@@ -541,12 +559,14 @@ async function sessionWait(
 ): Promise<ToolResult> {
   const notReady = sessionReady(store, directory)
   if (notReady) return notReady
-  const deadline = timeoutSeconds === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutSeconds * 1000
+  const started = Date.now()
+  const deadline = started + effectiveWaitMs(timeoutSeconds)
   try {
     while (true) {
       const status = await sessionRequest<StatusResult>(store!, directory, "status", sessionID, SESSION_WAIT_REQUEST_TIMEOUT_MS)
-      if (!status.running) return ok({ ...sessionWire(sessionID, status), timed_out: false })
-      if (Date.now() >= deadline) return ok({ ...sessionWire(sessionID, status), timed_out: true })
+      const waited_ms = Date.now() - started
+      if (!status.running) return ok({ ...sessionWire(sessionID, status), timed_out: false, waited_ms })
+      if (Date.now() >= deadline) return ok({ ...sessionWire(sessionID, status), timed_out: true, waited_ms })
       await delay(SESSION_WAIT_POLL_MS)
     }
   } catch (error) {

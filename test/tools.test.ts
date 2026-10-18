@@ -71,7 +71,45 @@ describe("runtime tools", () => {
     const id = structured(started).job_id as string
     const waited = await run("wait", { job_id: id, timeout_s: 0.05 })
     expect(structured(waited).timed_out).toBe(true)
+    expect(structured(waited).waited_ms).toBeGreaterThanOrEqual(40)
     await run("stop", { job_id: id })
+  })
+
+  test("wait clamps a long timeout below the client request timeout", async () => {
+    const previous = process.env.OPENCODE_BGJ_MAX_WAIT_MS
+    process.env.OPENCODE_BGJ_MAX_WAIT_MS = "150"
+    try {
+      const { run } = harness()
+      const started = await run("start", { command: "sleep 30" })
+      const id = structured(started).job_id as string
+      const began = Date.now()
+      const waited = await run("wait", { job_id: id, timeout_s: 300 })
+      expect(structured(waited).timed_out).toBe(true)
+      expect(structured(waited).waited_ms).toBeGreaterThanOrEqual(100)
+      expect(Date.now() - began).toBeLessThan(2000)
+      await run("stop", { job_id: id })
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_BGJ_MAX_WAIT_MS
+      else process.env.OPENCODE_BGJ_MAX_WAIT_MS = previous
+    }
+  })
+
+  test("wait with no timeout_s uses the clamp too", async () => {
+    const previous = process.env.OPENCODE_BGJ_MAX_WAIT_MS
+    process.env.OPENCODE_BGJ_MAX_WAIT_MS = "120"
+    try {
+      const { run } = harness()
+      const started = await run("start", { command: "sleep 30" })
+      const id = structured(started).job_id as string
+      const began = Date.now()
+      const waited = await run("wait", { job_id: id })
+      expect(structured(waited).timed_out).toBe(true)
+      expect(Date.now() - began).toBeLessThan(2000)
+      await run("stop", { job_id: id })
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_BGJ_MAX_WAIT_MS
+      else process.env.OPENCODE_BGJ_MAX_WAIT_MS = previous
+    }
   })
 
   test("output reads a session answered through the shared database", async () => {
@@ -171,6 +209,31 @@ describe("runtime tools", () => {
     const result = await dispatch(new JobManager(), store, undefined, "wait", { session_id: "ses_1" }, "/proj")
     await answered
     expect(structured(result)).toMatchObject({ session_id: "ses_1", session: true, running: false, timed_out: false })
+  })
+
+  test("session wait clamps the block and returns timed_out while still running", async () => {
+    const previous = process.env.OPENCODE_BGJ_MAX_WAIT_MS
+    process.env.OPENCODE_BGJ_MAX_WAIT_MS = "150"
+    const store = new JobStore(":memory:")
+    store.setInstance("/proj", "http://localhost:4096/")
+    let serving = true
+    const answered = (async () => {
+      while (serving) {
+        const [pending] = store.pendingSessionRequests("/proj")
+        if (pending) store.answerSessionRequest(pending.id, { running: true, messages: 1 })
+        await Bun.sleep(10)
+      }
+    })()
+    try {
+      const result = await dispatch(new JobManager(), store, undefined, "wait", { session_id: "ses_1" }, "/proj")
+      expect(structured(result)).toMatchObject({ session_id: "ses_1", session: true, running: true, timed_out: true })
+      expect(structured(result).waited_ms).toBeGreaterThanOrEqual(100)
+    } finally {
+      serving = false
+      await answered
+      if (previous === undefined) delete process.env.OPENCODE_BGJ_MAX_WAIT_MS
+      else process.env.OPENCODE_BGJ_MAX_WAIT_MS = previous
+    }
   })
 
   test("stop aborts a session through the shared database", async () => {
