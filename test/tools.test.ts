@@ -44,12 +44,57 @@ describe("runtime tools", () => {
     expect(structured(listed).jobs).toHaveLength(1)
   })
 
+  test("debug returns captured output and the exit code", async () => {
+    const { run } = harness()
+    const started = await run("start", { command: "printf hello; exit 3", notify: false })
+    const id = structured(started).job_id as string
+    await run("wait", { job_id: id, timeout_s: 5 })
+    const debug = structured(await run("debug", { job_id: id }))
+    expect(debug.exit_code).toBe(3)
+    expect(debug.status).toBe("failed")
+    expect(debug.output.text).toContain("hello")
+  })
+
+  test("debug lists the job's process group while it runs, and nothing once it stops", async () => {
+    const { run } = harness()
+    const started = await run("start", { command: "sleep 30", notify: false })
+    const id = structured(started).job_id as string
+    const debug = structured(await run("debug", { job_id: id }))
+    expect(debug.status).toBe("running")
+    expect(debug.processes.some((p: { pid: number }) => p.pid === debug.pid)).toBe(true)
+    await run("stop", { job_id: id })
+    const after = structured(await run("debug", { job_id: id }))
+    expect(after.status).toBe("killed")
+    expect(after.processes).toEqual([])
+  })
+
+  test("debug match greps command lines across all processes", async () => {
+    const { run } = harness()
+    const started = await run("start", { command: "sleep 30", notify: false })
+    const id = structured(started).job_id as string
+    await Bun.sleep(150)
+    const debug = structured(await run("debug", { job_id: id, match: "sleep 30" }))
+    expect(debug.processes.length).toBeGreaterThan(0)
+    await run("stop", { job_id: id })
+  })
+
+  test("debug reports a detached job's on-disk exit and log", async () => {
+    const { run } = harness()
+    const started = await run("run_detached", { command: "printf detached-debug" })
+    const id = structured(started).job_id as string
+    await run("wait", { job_id: id, timeout_s: 5 })
+    const debug = structured(await run("debug", { job_id: id }))
+    expect(debug.detached).toBe(true)
+    expect(debug.output.text).toContain("detached-debug")
+  })
+
   test("unknown tool and unknown job are error results, not throws", async () => {
     const { run } = harness()
     expect(await run("nope")).toMatchObject({ isError: true })
     expect(await run("status", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
     expect(await run("wait", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
     expect(await run("output", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
+    expect(await run("debug", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
   })
 
   test("malformed argument types are error results, not throws", async () => {

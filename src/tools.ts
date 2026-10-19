@@ -10,6 +10,9 @@ const SESSION_REQUEST_POLL_MS = 50
 // A detached job has no resident supervisor to block on, so wait polls its
 // on-disk status (a cheap marker read) at this interval until it settles.
 const DETACHED_WAIT_POLL_MS = 200
+// debug returns this much output by default so a huge log cannot swamp the
+// agent's context; pass offset: 0 for the whole thing.
+const DEBUG_DEFAULT_TAIL_BYTES = 4000
 
 // The opencode client abandons any MCP call after `mcp_timeout` (60 s by
 // default) with `-32001: Request timed out`, so a longer block is cancelled
@@ -58,7 +61,7 @@ export const TOOLS = [
     description: `Start a shell command as a background job and return immediately with a job id, without waiting for it to finish. Use it for long-running work (builds, tests, downloads, servers) so you can keep working while it runs.
 The command runs detached in its own process group, so it can be signalled as a group. Its stdout and stderr are captured into one merged buffer in the order produced; only the most recent 1 MiB is kept and older output is dropped.
 By default the job's final status and captured output are reported back to the agent as a message when it finishes, which also wakes an idle session. Set notify to false to suppress that, for example when you intend to call wait yourself.
-Returns the new job's job_id, command, cwd, pid, status ("running"), started_at, and elapsed_ms (milliseconds the job has been running). Use status, output, wait, and stop with the returned job_id to inspect or control it.
+Returns the new job's job_id, command, cwd, pid, status ("running"), started_at, and elapsed_ms (milliseconds the job has been running). Use status, output, debug, wait, and stop with the returned job_id to inspect or control it.
 
 Arguments:
 - command: shell command to run, invoked as <shell> -c <command>.
@@ -95,7 +98,7 @@ Arguments:
     name: "list",
     description: `List the background jobs and opencode sessions tracked by this server for the current directory, oldest first (by start time).
 Shell jobs are held in memory only and are lost when the MCP server exits; finished jobs stay listed until then. Sessions come from the bgj-notify plugin: the directory's child sessions (background subagents), so a background subagent shows up here. Detached jobs (run_detached) are included too.
-Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, elapsed_ms, and error (when the command could not be spawned). Session entries carry session_id, parent_id, title, status ("running" or "completed"), session (true), and running instead. Use the returned id with status, output, wait, and stop.
+Returns an array of jobs, each with job_id, command, cwd, pid, status ("running", "completed", "failed", "timed_out", or "killed"), exit_code, started_at, ended_at, elapsed_ms, and error (when the command could not be spawned). Session entries carry session_id, parent_id, title, status ("running" or "completed"), session (true), and running instead. Use the returned id with status, output, debug, wait, and stop.
 Set active_only to true to show only entries that are still running.`,
     inputSchema: {
       type: "object",
@@ -132,6 +135,23 @@ Returns the id, text, size_bytes (total produced so far, even if some was droppe
         tail_bytes: { type: "integer", minimum: 0, description: "Return only the last N bytes of output instead of everything from the start." },
         offset: { type: "integer", minimum: 0, description: "Return output starting at this 0-based byte offset into the job's total output." },
       },
+    },
+  },
+  {
+    name: "debug",
+    description: `Gather everything needed to see what happened with a job in one call: its status and exit code, the captured output, and the processes still alive for it. Use it instead of shelling out to read a run's exit file, log, and process list.
+Pass job_id for a start, run_job, or run_detached job. Returns all the fields of status (job_id, command, cwd, pid, status, exit_code, started_at, ended_at, elapsed_ms) plus output ({ text, size_bytes, truncated }) and processes.
+processes lists the live members of the job's own process group (pid, ppid, stat, elapsed, command), which is the shell and everything it spawned. It is sampled only while the job is running, because a finished job's group id may have been reused; pass match to instead grep every process on the machine by command line (case-insensitive substring), which also finds children that detached from the group.
+output defaults to the last 4000 bytes; pass tail_bytes or offset to change the slice, or offset: 0 for the whole log. Returns an error result if the job id is not tracked.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Background job id returned by start, run_job, or run_detached." },
+        tail_bytes: { type: "integer", minimum: 0, description: "Return only the last N bytes of output (default 4000)." },
+        offset: { type: "integer", minimum: 0, description: "Return output starting at this 0-based byte offset; overrides tail_bytes." },
+        match: { type: "string", description: "Instead of the job's process group, grep every process by this case-insensitive substring of its command line." },
+      },
+      required: ["job_id"],
     },
   },
   {
@@ -247,7 +267,7 @@ By default the result is reported back to the agent as a message when the job fi
   {
     name: "run_detached",
     description: `Run a shell command fully detached from this session and return immediately with its job id and log path. The command keeps running after the session (and this server) exits, and it never sends a completion notification: it is fire-and-forget.
-Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, wait, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
+Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, debug, wait, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
 Use it for work that must outlive the session: a long download, a build, or a one-off server you want to survive a restart. For work you want to observe and be woken about inside this session, use start instead.
 There is no timeout_ms: nothing stays resident to enforce one.
 Returns the job_id, command, cwd, pid, status ("running"), started_at, elapsed_ms (milliseconds it has been running), the log file path, and detached ("true").`,
@@ -322,6 +342,23 @@ export async function dispatch(
             return ok({ job_id: id, ...(info ? { elapsed_ms: info.elapsed_ms } : {}), ...job })
           }
           return unknownJob(id)
+        })
+      }
+      case "debug": {
+        return await withIdAsync(args.job_id, async (id) => {
+          const info = jobs.status(id)
+          const detachedJob = info ? undefined : detached?.status(id)
+          if (!info && !detachedJob) return unknownJob(id)
+          const base: Record<string, unknown> = info ? toWire(info) : (detachedJob as unknown as Record<string, unknown>)
+          const tailBytes = optionalInt(args.tail_bytes) ?? DEBUG_DEFAULT_TAIL_BYTES
+          const options = { tailBytes, offset: optionalInt(args.offset) }
+          const output = (info ? jobs.output(id, options) : detached?.output(id, options)) ?? { text: "", size_bytes: 0, truncated: false }
+          const match = optionalStr(args.match)
+          // Only the job's group is safe to sample while it runs: once it exits
+          // the group id can be recycled by an unrelated process.
+          const probe = match !== undefined || base.status === "running"
+          const { processes, processes_error } = probe ? await jobProcesses(base.pid as number, match) : { processes: [] }
+          return ok(compact({ ...base, output, processes, processes_error }))
         })
       }
       case "stop": {
@@ -643,6 +680,46 @@ function sessionToWire(summary: SessionSummary) {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+interface ProcessLine {
+  pid: number
+  ppid: number
+  stat: string
+  elapsed: string
+  command: string
+}
+
+// Lists processes either in the job's process group (pgid, which equals the
+// leader pid because every job is spawned with detached: true) or, when match
+// is given, anywhere on the machine whose command line contains it. `ps` is the
+// simplest portable source and is already assumed present on Linux.
+async function jobProcesses(
+  pgid: number,
+  match?: string,
+): Promise<{ processes: ProcessLine[]; processes_error?: string }> {
+  const pattern = match?.toLowerCase()
+  if (pattern === undefined && (!Number.isInteger(pgid) || pgid <= 0)) return { processes: [] }
+  try {
+    const proc = Bun.spawn({
+      cmd: ["ps", "-eo", "pid=,ppid=,pgid=,stat=,etime=,args="],
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    const text = await new Response(proc.stdout).text()
+    await proc.exited
+    const processes: ProcessLine[] = []
+    for (const line of text.split("\n")) {
+      const fields = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/)
+      if (!fields) continue
+      const command = fields[6]!
+      if (pattern !== undefined ? !command.toLowerCase().includes(pattern) : Number(fields[3]) !== pgid) continue
+      processes.push({ pid: Number(fields[1]), ppid: Number(fields[2]), stat: fields[4]!, elapsed: fields[5]!, command })
+    }
+    return { processes }
+  } catch (error) {
+    return { processes: [], processes_error: errorMessage(error) }
+  }
 }
 
 function unknownDefinition(ref: string): ToolResult {

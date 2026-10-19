@@ -42,6 +42,7 @@ with `bgj_`.
 | `list` | `{ active_only? }` | `{ jobs: [...] }` (shell, detached, and session entries) |
 | `status` | `{ job_id?, session_id? }` | job info, or session status |
 | `output` | `{ job_id?, session_id?, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
+| `debug` | `{ job_id, tail_bytes?, offset?, match? }` | job info, `output`, `processes` |
 | `stop` | `{ job_id?, session_id?, signal? }` | job info, or `{ session_id, session, aborted }` |
 | `wait` | `{ job_id?, session_id?, timeout_s? }` | `{ job, timed_out, waited_ms }` or `{ session_id, ..., timed_out, waited_ms }` |
 
@@ -61,11 +62,21 @@ to install it.
 `output` with a `job_id` reads a shell job's merged stdout and stderr buffer,
 sliced by `tail_bytes` or `offset`.
 
+`debug` gathers everything needed to see what happened with a `job_id` in one
+call, so you do not have to shell out to read a run's exit file, log, and
+process list. It returns all the fields of `status` plus `output` (the last 4000
+bytes by default; pass `offset: 0` for the whole log) and `processes`, the live
+members of the job's own process group: the shell and everything it spawned.
+The group is sampled only while the job is running, because a finished job's
+group id can be reused by an unrelated process; pass `match` to instead grep
+every process on the machine by command line, which also catches children that
+detached from the group.
+
 `run_detached` starts a command fully detached in its own session so it keeps
 running after opencode exits, and it never sends a completion notification:
 fire-and-forget. Its merged stdout and stderr go to a per-job log file and its
-exit status is kept on disk, so `status`, `output`, and `stop` still work on it
-later, even in a new session. `list` includes detached jobs, flagged
+exit status is kept on disk, so `status`, `output`, `debug`, and `stop` still
+work on it later, even in a new session. `list` includes detached jobs, flagged
 `detached: true`, alongside the in-memory ones. Use it for a long download, a
 build, or a server you want to survive a restart; use `start` for work you want
 to observe and be woken about inside this session. There is no `timeout_ms`:
