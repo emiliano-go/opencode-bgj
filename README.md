@@ -167,7 +167,11 @@ Caveats:
   blocked. The block is capped at 45 s (`OPENCODE_BGJ_MAX_WAIT_MS`), safely below
   the client's 60 s `mcp_timeout`, so the call always resolves before the client
   cancels it with `-32001: Request timed out`. When `timed_out` is true the job is
-  still running, so call `wait` again to keep waiting.
+  still running, so call `wait` again to keep waiting. A detached job has no
+  resident process to block on, so `wait` polls its on-disk status instead and
+  still reports the result, even after the server that started it has exited.
+- `timeout_s: 0` turns `wait` into a one-shot check of any job or session, so you
+  can read the current state without blocking.
 - Runtime jobs are in-memory only. They live as long as the opencode session and
   stop with the MCP server. Detached jobs are the exception: they keep running
   after the server exits and their output and status persist on disk. Job

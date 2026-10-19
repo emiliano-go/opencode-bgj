@@ -402,4 +402,27 @@ describe("persistent job tools", () => {
     const jobs = new JobManager()
     expect(await dispatch(jobs, undefined, undefined, "run_detached", { command: "true" })).toMatchObject({ isError: true })
   })
+
+  test("wait polls and reports a detached job, which no other job type can", async () => {
+    const { run } = harness()
+    const started = await run("run_detached", { command: "printf detached-wait" })
+    const id = structured(started).job_id as string
+    const waited = await run("wait", { job_id: id, timeout_s: 5 })
+    expect(structured(waited).job.status).toBe("completed")
+    expect(structured(waited).job.detached).toBe(true)
+    expect(structured(waited).timed_out).toBe(false)
+  })
+
+  test("wait with timeout_s 0 checks a running detached job without blocking", async () => {
+    const { run } = harness()
+    const started = await run("run_detached", { command: "sleep 30" })
+    const id = structured(started).job_id as string
+    const began = Date.now()
+    const checked = await run("wait", { job_id: id, timeout_s: 0 })
+    expect(structured(checked).job.status).toBe("running")
+    expect(structured(checked).timed_out).toBe(true)
+    expect(structured(checked).waited_ms).toBeLessThan(150)
+    expect(Date.now() - began).toBeLessThan(2000)
+    await run("stop", { job_id: id })
+  })
 })

@@ -7,6 +7,9 @@ const SESSION_REQUEST_TIMEOUT_MS = 5000
 const SESSION_WAIT_REQUEST_TIMEOUT_MS = 10000
 const SESSION_WAIT_POLL_MS = 1000
 const SESSION_REQUEST_POLL_MS = 50
+// A detached job has no resident supervisor to block on, so wait polls its
+// on-disk status (a cheap marker read) at this interval until it settles.
+const DETACHED_WAIT_POLL_MS = 200
 
 // The opencode client abandons any MCP call after `mcp_timeout` (60 s by
 // default) with `-32001: Request timed out`, so a longer block is cancelled
@@ -148,10 +151,11 @@ Calling stop on a job that has already finished is a no-op and returns its final
   },
   {
     name: "wait",
-    description: `Block until a background job or session finishes, or until the timeout elapses, then return its final state. Pass job_id for a shell job, or session_id to wait until an opencode session goes idle (for example a background subagent's turn completes). Pass exactly one of job_id or session_id.
+    description: `Block until a background job or session finishes, or until the timeout elapses, then return its final state. Pass job_id for a shell or detached job, or session_id to wait until an opencode session goes idle (for example a background subagent's turn completes). Pass exactly one of job_id or session_id.
 Use wait ONLY when you have nothing else to do in the meantime but wait for this job; it suspends the turn until the job ends or timeout_s elapses. If you could be doing other work while the job runs, do NOT call wait: start the job with notify left at its default and continue, and the completion message will wake you when it is done. Never call wait merely to poll for progress.
-The wait is capped at the server limit (about 45 s) so it always returns before the client's request timeout. A result with timed_out: true means the job is still running: call wait again to keep waiting. Passing timeout_s: 0 returns immediately with the current state. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
-Returns the finished job (or its latest state if the timeout elapsed), timed_out, which is true when the timeout was reached before the job finished, and waited_ms, the time actually blocked. Errors if the job id is not tracked.`,
+A detached job (run_detached) has no resident process to block on, so wait polls its on-disk status instead; it still reports the result, even after the server that started it has exited.
+The wait is capped at the server limit (about 45 s) so it always returns before the client's request timeout. A result with timed_out: true means the job is still running: call wait again to keep waiting. Passing timeout_s: 0 returns immediately with the current state, which checks any job or session without blocking. When you wait inline, prefer starting the job with notify: false so you do not also receive a completion message.
+Returns the finished job (or its latest state if the timeout elapsed), timed_out, which is true when the timeout was reached before the job finished (or, for a detached job, when it is still running), and waited_ms, the time actually blocked. Errors if the job id is not tracked.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -243,7 +247,7 @@ By default the result is reported back to the agent as a message when the job fi
   {
     name: "run_detached",
     description: `Run a shell command fully detached from this session and return immediately with its job id and log path. The command keeps running after the session (and this server) exits, and it never sends a completion notification: it is fire-and-forget.
-Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
+Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, wait, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
 Use it for work that must outlive the session: a long download, a build, or a one-off server you want to survive a restart. For work you want to observe and be woken about inside this session, use start instead.
 There is no timeout_ms: nothing stays resident to enforce one.
 Returns the job_id, command, cwd, pid, status ("running"), started_at, elapsed_ms (milliseconds it has been running), the log file path, and detached ("true").`,
@@ -334,10 +338,24 @@ export async function dispatch(
         const sessionID = optionalStr(args.session_id)
         if (sessionID !== undefined) return await sessionWait(store, directory, sessionID, optionalNumber(args.timeout_s))
         return await withIdAsync(args.job_id, async (id) => {
-          if (!jobs.status(id)) return unknownJob(id)
+          if (jobs.status(id)) {
+            const started = Date.now()
+            const result = await jobs.wait(id, effectiveWaitMs(optionalNumber(args.timeout_s)))
+            return ok({ job: toWire(result.job), timed_out: result.timed_out, waited_ms: Date.now() - started })
+          }
+          const detachedJob = detached?.status(id)
+          if (!detachedJob) return unknownJob(id)
+          // A detached job is not resident, so wait polls its on-disk status
+          // instead of blocking on a live process; timeout_s: 0 makes that poll
+          // a one-shot check of any job, detached or not.
           const started = Date.now()
-          const result = await jobs.wait(id, effectiveWaitMs(optionalNumber(args.timeout_s)))
-          return ok({ job: toWire(result.job), timed_out: result.timed_out, waited_ms: Date.now() - started })
+          const deadline = started + effectiveWaitMs(optionalNumber(args.timeout_s))
+          let current = detachedJob
+          while (current.status === "running" && Date.now() < deadline) {
+            await delay(DETACHED_WAIT_POLL_MS)
+            current = detached!.status(id) ?? current
+          }
+          return ok({ job: current, timed_out: current.status === "running", waited_ms: Date.now() - started })
         })
       }
       case "create_job":
