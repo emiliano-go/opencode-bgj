@@ -39,6 +39,7 @@ with `bgj_`.
 |---|---|---|
 | `start` | `{ command, cwd?, env?, shell?, timeout_ms?, notify? }` | job info |
 | `run_detached` | `{ command, cwd?, env?, shell? }` | job info, `detached: true`, `log` |
+| `detach` | `{ job_id }` | detached job info |
 | `list` | `{ active_only? }` | `{ jobs: [...] }` (shell, detached, and session entries) |
 | `status` | `{ job_id?, session_id? }` | job info, or session status |
 | `output` | `{ job_id?, session_id?, tail_bytes?, offset? }` | `{ text, size_bytes, truncated }` |
@@ -81,6 +82,14 @@ work on it later, even in a new session. `list` includes detached jobs, flagged
 build, or a server you want to survive a restart; use `start` for work you want
 to observe and be woken about inside this session. There is no `timeout_ms`:
 nothing stays resident to enforce one.
+
+`detach` promotes a job already started with `start` or `run_job` to a detached
+job. Output captured so far is written to its log and later output keeps
+streaming there while this server is alive; the job leaves the in-memory list
+and is tracked on disk from then on. Like `run_detached` it sends no completion
+notification, and its exact exit code is only recorded if the server is still
+running when it exits; otherwise a later check sees the process is gone and
+reports `failed` with `exit_code: null`.
 
 ### Persistent job definitions
 
@@ -181,6 +190,9 @@ Caveats:
   still running, so call `wait` again to keep waiting. A detached job has no
   resident process to block on, so `wait` polls its on-disk status instead and
   still reports the result, even after the server that started it has exited.
+  A shell that exits while a child it spawned still holds the output pipe (for
+  example `daemon &`) finishes normally: the pipe is drained briefly instead of
+  keeping the job `running` and stalling `wait`.
 - `timeout_s: 0` turns `wait` into a one-shot check of any job or session, so you
   can read the current state without blocking.
 - Runtime jobs are in-memory only. They live as long as the opencode session and
@@ -206,7 +218,8 @@ Every runtime job info object contains:
 - `error`: present only when the process could not be spawned.
 
 A detached job also carries `detached: true` and `log`, the path to its output
-file. It can never be `timed_out`, and `killed` means it was stopped on request.
+file. `run_detached` jobs can never be `timed_out`; a `start` job promoted with
+`detach` can still time out. `killed` means it was stopped on request.
 
 ### Job definition info
 

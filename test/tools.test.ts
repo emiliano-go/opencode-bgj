@@ -88,6 +88,59 @@ describe("runtime tools", () => {
     expect(debug.output.text).toContain("detached-debug")
   })
 
+  test("detach promotes a runtime job and streams later output to disk", async () => {
+    const { run, store } = harness()
+    const started = await run("start", { command: "printf before; sleep 0.2; printf after", notify: false })
+    const id = structured(started).job_id as string
+    const promoted = structured(await run("detach", { job_id: id }))
+    expect(promoted.detached).toBe(true)
+    expect(promoted.status).toBe("running")
+    expect(promoted.log).toContain(`${id}.log`)
+
+    const waited = structured(await run("wait", { job_id: id, timeout_s: 5 }))
+    expect(waited.timed_out).toBe(false)
+    expect(waited.job.status).toBe("completed")
+
+    const out = structured(await run("output", { job_id: id }))
+    expect(out.text).toBe("beforeafter")
+
+    const reloaded = new DetachedManager(store)
+    expect(reloaded.status(id)?.status).toBe("completed")
+  })
+
+  test("detach preserves a finished runtime job", async () => {
+    const { run } = harness()
+    const started = await run("start", { command: "printf done", notify: false })
+    const id = structured(started).job_id as string
+    const waited = structured(await run("wait", { job_id: id, timeout_s: 5 }))
+
+    const promoted = structured(await run("detach", { job_id: id }))
+    expect(promoted.detached).toBe(true)
+    expect(promoted.status).toBe("completed")
+    expect(promoted.ended_at).toBe(waited.job.ended_at)
+    expect(structured(await run("output", { job_id: id })).text).toBe("done")
+  })
+
+  test("a detached runtime job is stopped through the detached record", async () => {
+    const { run } = harness()
+    const started = await run("start", { command: "sleep 30", notify: false })
+    const id = structured(started).job_id as string
+    await run("detach", { job_id: id })
+    const stopped = structured(await run("stop", { job_id: id }))
+    expect(stopped.detached).toBe(true)
+    expect(stopped.status).toBe("killed")
+  })
+
+  test("detach reports unknown and already-detached jobs", async () => {
+    const { run } = harness()
+    expect(await run("detach", { job_id: "bgj-missing" })).toMatchObject({ isError: true })
+    const started = await run("run_detached", { command: "sleep 30" })
+    const id = structured(started).job_id as string
+    const again = structured(await run("detach", { job_id: id }))
+    expect(again.detached).toBe(true)
+    await run("stop", { job_id: id })
+  })
+
   test("unknown tool and unknown job are error results, not throws", async () => {
     const { run } = harness()
     expect(await run("nope")).toMatchObject({ isError: true })

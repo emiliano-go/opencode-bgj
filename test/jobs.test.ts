@@ -20,6 +20,22 @@ describe("JobManager", () => {
     expect(out.size_bytes).toBe(10)
   })
 
+  test("finishes when a child keeps the output pipe open", async () => {
+    const jobs = new JobManager()
+    const job = jobs.start({ command: "sleep 30 & printf done" })
+    const started = Date.now()
+    const { job: done, timed_out } = await jobs.wait(job.id, 5_000)
+    expect(timed_out).toBe(false)
+    expect(done.status).toBe("completed")
+    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(jobs.output(job.id)!.text).toContain("done")
+    try {
+      process.kill(-job.pid, "SIGKILL")
+    } catch {
+      // the child already exited
+    }
+  })
+
   test("marks a non-zero exit as failed", async () => {
     const jobs = new JobManager()
     const job = jobs.start({ command: "exit 3" })

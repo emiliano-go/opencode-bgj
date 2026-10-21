@@ -1,5 +1,5 @@
-import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from "node:fs"
-import type { Status } from "./jobs"
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, writeFileSync } from "node:fs"
+import type { JobInfo, Status } from "./jobs"
 import type { DetachedRun, JobStore } from "./store"
 
 export interface DetachedStatus {
@@ -91,6 +91,51 @@ export class DetachedManager {
       .listDetached()
       .filter((row) => directory === undefined || row.directory === directory)
       .map((row) => this.snapshot(this.reconcile(row)))
+  }
+
+  // Takes over a runtime job. Output already captured is written to its log,
+  // and the row starts in whatever state the job is in. The caller feeds later
+  // chunks through append() and the final state through finish().
+  adopt(info: JobInfo, output: string, directory?: string): DetachedStatus {
+    writeFileSync(this.store.detachedLogPath(info.id), output)
+    this.store.createDetached({
+      id: info.id,
+      command: info.command,
+      cwd: info.cwd,
+      pid: info.pid,
+      status: info.status,
+      exit_code: info.exit_code,
+      started_at: info.started_at,
+      ended_at: info.ended_at,
+      directory,
+    })
+    return this.snapshot(this.store.detached(info.id)!)
+  }
+
+  append(id: string, chunk: Uint8Array): void {
+    try {
+      appendFileSync(this.store.detachedLogPath(id), chunk)
+    } catch {
+      // a log write failure must never break job tracking
+    }
+  }
+
+  finish(id: string, status: Status, exitCode: number | null, endedAt?: number | null): void {
+    const row = this.store.detached(id)
+    if (!row) return
+    // A stop requested through DetachedManager is authoritative; the runtime
+    // only saw the signal's numeric code, not the intent.
+    const finalStatus: Status = existsSync(this.store.detachedStopPath(id)) ? "killed" : status
+    this.store.updateDetached(id, { status: finalStatus, exit_code: exitCode, ended_at: endedAt ?? Date.now() })
+    try {
+      if (finalStatus === "completed" || finalStatus === "failed") {
+        writeFileSync(this.store.detachedExitPath(id), String(exitCode ?? 1))
+      } else if (finalStatus === "killed") {
+        writeFileSync(this.store.detachedStopPath(id), "")
+      }
+    } catch {
+      // the row above already records the outcome; markers only help reconcile
+    }
   }
 
   status(id: string): DetachedStatus | undefined {

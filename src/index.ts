@@ -45,6 +45,9 @@ const detached = store ? new DetachedManager(store) : undefined
 const directory = process.cwd()
 
 const jobs = new JobManager((result) => {
+  // A detached job was already handed to DetachedManager, which records its
+  // outcome on disk; it must not enter the notification queue or job_runs.
+  if (result.detached) return
   if (!store) return
   const info = result.info
   const meta = result.meta ?? {}

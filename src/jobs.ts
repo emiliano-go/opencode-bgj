@@ -27,6 +27,7 @@ export interface JobResult {
   output: string
   notify: boolean
   meta?: Record<string, unknown>
+  detached?: boolean
 }
 
 export interface OutputOptions {
@@ -48,6 +49,11 @@ export interface WaitResult {
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const KILL_GRACE_MS = 5_000
 const DEFAULT_SHELL = "/bin/sh"
+// The shell can exit while a child it spawned still holds the stdout/stderr
+// pipe open (for example `daemon &`). Waiting for the pipes to close would keep
+// the job "running" and hang wait forever, so drain them only briefly after the
+// shell exits.
+const OUTPUT_DRAIN_GRACE_MS = 250
 
 // ponytail: in-memory only. Jobs die with this process (the MCP server, a child
 // of opencode). Use run_detached (src/detached.ts) for jobs that must outlive
@@ -160,19 +166,45 @@ export class JobManager {
     return { job: snapshot(entry), timed_out: winner === "timeout" }
   }
 
+  // Hands a runtime job over to the detached store. The job disappears from
+  // this manager, so later lookups route to the on-disk record; onChunk keeps
+  // future output flowing to that record, and onExit reports the final state.
+  detach(id: string, onChunk?: (chunk: Uint8Array) => void, onExit?: (info: JobInfo) => void): JobInfo | undefined {
+    const entry = this.jobs.get(id)
+    if (!entry) return undefined
+    this.jobs.delete(id)
+    entry.detached = true
+    entry.notify = false
+    entry.sink = onChunk
+    entry.onExit = onExit
+    // The exit hook may already have run for a job that finished before it was
+    // promoted; replay it so the on-disk record gets the final state.
+    if (entry.info.status !== "running") {
+      try {
+        entry.onExit?.(snapshot(entry))
+      } catch {
+        // a store failure must never break job tracking
+      }
+    }
+    return snapshot(entry)
+  }
+
   private async track(entry: Entry, proc: Bun.Subprocess) {
     const pumps: Promise<void>[] = []
     const stdout = proc.stdout
     const stderr = proc.stderr
-    if (stdout && typeof stdout !== "number") pumps.push(pump(stdout, (chunk) => entry.buffer.append(chunk)))
-    if (stderr && typeof stderr !== "number") pumps.push(pump(stderr, (chunk) => entry.buffer.append(chunk)))
+    const append = (chunk: Uint8Array) => {
+      entry.buffer.append(chunk)
+      entry.sink?.(chunk)
+    }
+    if (stdout && typeof stdout !== "number") pumps.push(pump(stdout, append))
+    if (stderr && typeof stderr !== "number") pumps.push(pump(stderr, append))
     let code: number | null = null
     try {
       code = await proc.exited
     } catch {
       // reaping failed; record the job as failed instead of leaving it running forever
     }
-    await Promise.allSettled(pumps)
     if (entry.timeoutTimer !== undefined) clearTimeout(entry.timeoutTimer)
     if (entry.info.status === "running") {
       entry.info.ended_at = Date.now()
@@ -180,6 +212,16 @@ export class JobManager {
       entry.info.status =
         entry.stopReason === "timeout" ? "timed_out" : entry.stopReason === "user" ? "killed" : code === 0 ? "completed" : "failed"
     }
+    // Report the final state before draining so an on-disk record never waits on
+    // a pipe-holding child.
+    try {
+      entry.onExit?.(snapshot(entry))
+    } catch {
+      // a store failure must never break job tracking
+    }
+    // Give the pumps a moment to read bytes written just before exit, but never
+    // let a pipe-holding child keep the job running or delay wait forever.
+    await Promise.race([Promise.allSettled(pumps), delay(OUTPUT_DRAIN_GRACE_MS)])
     entry.resolveExit()
     this.emit(entry)
   }
@@ -245,6 +287,7 @@ export class JobManager {
         output: new TextDecoder().decode(entry.buffer.read(0)),
         notify: entry.notify,
         meta: entry.meta,
+        detached: entry.detached,
       })
     } catch {
       // a store failure must never break job tracking
@@ -268,6 +311,9 @@ interface Entry {
   notify: boolean
   meta?: Record<string, unknown>
   timeoutTimer?: ReturnType<typeof setTimeout>
+  detached?: boolean
+  sink?: (chunk: Uint8Array) => void
+  onExit?: (info: JobInfo) => void
 }
 
 class OutputBuffer {
@@ -337,6 +383,10 @@ async function pump(stream: ReadableStream<Uint8Array>, onChunk: (chunk: Uint8Ar
 
 function snapshot(entry: Entry): JobInfo {
   return { ...entry.info }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function newId(): string {

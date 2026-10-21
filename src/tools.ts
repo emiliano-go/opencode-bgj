@@ -265,6 +265,18 @@ By default the result is reported back to the agent as a message when the job fi
     },
   },
   {
+    name: "detach",
+    description: `Promote a running (or finished) job started with start or run_job to a detached job, so it is tracked on disk instead of in this server's memory. Its output captured so far is written to a per-job log, and later output keeps streaming there while this server is alive. From then on status, output, debug, wait, and stop read the detached record, and the job's process keeps running if this server exits.
+A detached job sends no completion notification, and its exact exit code is only recorded if this server is still running when it exits; otherwise a later lookup sees the process is gone and reports failed with exit_code null. Already-detached jobs are returned unchanged. Returns the detached job info (including detached: true and log), or an error if the job id is not tracked.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Background job id returned by start or run_job." },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
     name: "run_detached",
     description: `Run a shell command fully detached from this session and return immediately with its job id and log path. The command keeps running after the session (and this server) exits, and it never sends a completion notification: it is fire-and-forget.
 Its merged stdout and stderr are written to a per-job log file and its exit status is recorded on disk, so status, output, debug, wait, and stop keep working later, even in a new session, by reading the log file and checking whether the process is still alive.
@@ -302,12 +314,30 @@ export async function dispatch(
 ): Promise<ToolResult> {
   try {
     if (name === "run_detached" && (!store || !detached)) return fail("job store unavailable")
+    if (name === "detach" && (!store || !detached)) return fail("job store unavailable")
     if (!store && PERSISTENT_TOOLS.has(name)) return fail("job store unavailable")
     switch (name) {
       case "start":
         return ok(toWire(jobs.start(readStart(args))))
       case "run_detached":
         return ok(detached!.start(readDetached(args), directory))
+      case "detach": {
+        return withId(args.job_id, (id) => {
+          const info = jobs.status(id)
+          if (!info) {
+            const job = detached!.status(id)
+            return job ? ok(job) : unknownJob(id)
+          }
+          const output = jobs.output(id)?.text ?? ""
+          const job = detached!.adopt(info, output, directory)
+          jobs.detach(
+            id,
+            (chunk) => detached!.append(id, chunk),
+            (done) => detached!.finish(id, done.status, done.exit_code, done.ended_at),
+          )
+          return ok(job)
+        })
+      }
       case "list": {
         const activeOnly = args.active_only === true
         const entries: object[] = jobs.list(activeOnly).map(toWire)
